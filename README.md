@@ -1,18 +1,18 @@
 # BiedaMT
 
-Desktopowy tłumacz EN↔PL z pamięcią TMX (RAG) — jedna aplikacja: hotkey, tray, llama-server i API.
+Desktopowy tłumacz EN↔PL z pamięcią TMX (RAG) — jedna aplikacja: globalny hotkey, tray, llama-server i API.
 
 ## Co robi
 
-- Uruchamia w tle **llama-server** (llama.cpp) z podanym modelem i łączy się z nim
+- Uruchamia w tle **llama-server** (llama.cpp) z podanym modelem GGUF i komunikuje się z nim po HTTP
 - Ładuje pamięci TMX z folderu `memories/` do **ChromaDB** (embeddingi `intfloat/multilingual-e5-small` z prefiksami `query:`/`passage:`)
-- Rejestruje **hotkey** — po naciśnięciu: `ctrl+c` → tłumaczenie z RAG → `delete` → `ctrl+v`
+- Rejestruje **hotkey** — po naciśnięciu: `ctrl+c` → tłumaczenie → `delete` → `ctrl+v`, czyli tekst podmieniany jest w miejscu kursora
 - **Exact/fuzzy match** — dokładnie lub niemal identyczne zdanie wraca prosto z pamięci TMX (natychmiast, bez LLM); reszta: referencje RAG filtrowane po podobieństwie
-- **Glosariusz z TMX** — krótkie segmenty pamięci (≤ `terms_max_words` słów) działają jak termbase: trafione w tekście terminy trafiają do promptu jako obowiązkowe tłumaczenia (spójność terminologiczna niezależnie od fuzzy)
-- Ikona w **tray** (pystray): wybór pamięci, kierunek tłumaczenia, włączenie/wyłączenie hotkeya
+- **Glosariusz z TMX** — krótkie segmenty pamięci (≤ `rag.terms_max_words` słów) działają jak termbase: trafione w tekście terminy trafiają do promptu jako obowiązkowe tłumaczenia (spójność terminologiczna niezależnie od fuzzy)
+- Ikona w **tray** (pystray): wybór pamięci, kierunek tłumaczenia, włączenie/wyłączenie hotkeya; tooltip pokazuje licznik przetłumaczonych słów i znaków
 - **Okno ustawień** (`Settings` w menu tray) — cała konfiguracja z GUI: wybór plików, nagrywanie hotkeya z klawiatury, walidacja; jasno oznacza, które zmiany działają od razu, a które wymagają restartu llama-servera (przycisk „Restart LLM”) albo całej aplikacji
 - **Ładowanie pamięci na żądanie** — `Refresh memories` dopisuje nowe TMX, `Reload memory → nazwa` wymusza re-import zaktualizowanego TMX (apka nie obserwuje folderu na bieżąco)
-- GUI w przeglądarce pod `http://localhost:12345/` — lista pamięci, reload, delete
+- GUI w przeglądarce pod `http://localhost:12345/` (port = `server.port`) — lista pamięci, reload, delete
 
 ## Wymagania
 
@@ -36,12 +36,15 @@ Aplikacja wymaga `config.yaml` przy starcie — bez niego nie uruchomi się.
 
 Wszystko w `config.yaml` — żadnych hardkodów w kodzie. W repo leży szablon `config.example.yaml`; `config.yaml` tworzysz z niego lokalnie i **nie commitujesz** (zawiera prywatne ścieżki do modelu i llama-servera — jest w `.gitignore`):
 
-- `llama` — ścieżka do llama-server, model, argumenty CLI, port
-- `server` — port FastAPI (domyślnie 12345)
+- `llama` — ścieżka do llama-server, model, argumenty CLI, port, timeouty
+- `server` — port FastAPI (domyślnie 12345) i host; domyślny `0.0.0.0` = API dostępne z sieci lokalnej, `127.0.0.1` = tylko ten komputer
 - `rag` — model embeddingów, device (cpu/cuda), liczba wyników, progi dopasowań (fuzzy/reference), glosariusz (`terms_*`)
 - `translation` — domyślna pamięć, temperatura, max_tokens
+- `prompt` — szablony promptu tłumaczenia; zmiany wchodzą po `Reload prompt` w menu tray, bez restartu
 - `memories` — folder TMX, ścieżka ChromaDB
-- `ui` — hotkey, ikony, nazwa apki
+- `ui` — hotkey, ikony, nazwa apki, ścieżka `replacements.py`
+
+Uwaga na port llama-servera: figuruje w dwóch miejscach (`llama.port` i `--port` w `llama.args`). Okno ustawień synchronizuje je przy zapisie, ale przy ręcznej edycji pliku trzeba zmienić oba.
 
 `config.yaml` możesz edytować ręcznie albo w **oknie ustawień** (`Settings` w menu tray). Zapis z okna zachowuje komentarze w pliku (ruamel.yaml) i tworzy kopię zapasową `config.yaml.bak`. Większość ustawień działa od razu (hotkey, progi RAG, temperatura, szablony promptu, timeouty); zmiany ścieżek/argumentów/portu llama wymagają kliknięcia „Restart LLM” w oknie, a port/host API, ścieżki pamięci, model embeddingów i limity terminów — restartu całej aplikacji (okno mówi, które pola).
 
@@ -60,7 +63,7 @@ python main.py
 Menu tray:
 - **Hotkey active/inactive** — włącza/wyłącza hotkey
 - **Memory** — wybór jednej z pamięci albo "All" (szukanie we wszystkich)
-- **EN→PL / PL→EN** — kierunek tłumaczenia
+- **EN -> PL / PL -> EN** — kierunek tłumaczenia
 - **Reload memory** — wymusza re-import zaktualizowanego TMX do ChromaDB (submenu: wybór pamięci)
 - **Refresh memories** — przeskanowanie folderu `memories/` (dopisuje nowe)
 - **Reload replacements** — przeładowanie reguł zamian z `replacements.py`
@@ -74,9 +77,9 @@ Wrzuć pliki `.tmx` do folderu `memories/`. Nazwa pliku (bez rozszerzenia) to na
 
 ## API
 
-Dla narzędzi zewnętrznych (ogarniają systemprompt same):
+Dla narzędzi zewnętrznych — klient ustawia własny system prompt. API nie ma żadnego uwierzytelniania, więc przy domyślnym `host: 0.0.0.0` każdy komputer w sieci lokalnej może z niego korzystać i zarządzać pamięciami; jeśli to problem, ustaw `server.host: 127.0.0.1`.
 
-- `POST /v1/chat/completions` — OpenAI-compatible; jeśli ostatnia wiadomość usera zaczyna się od `\n[USER_PROMPT]\n`, do results są dokładane referencje RAG jako `\n[REFERENCES]\n{json}`
+- `POST /v1/chat/completions` — OpenAI-compatible; jeśli wiadomość usera zaczyna się od `\n[USER_PROMPT]\n`, tuż przed nią wstawiana jest osobna wiadomość `\n[REFERENCES]\n{json}` z trafieniami RAG. Bez tego znacznika zapytanie idzie do llama-servera bez RAG. Opcjonalne pole `rag_memory` ogranicza wyszukiwanie do jednej pamięci (brak = wszystkie)
 - `GET /v1/memories` — lista pamięci
 - `POST /v1/memories/{name}/reload` — przeładowanie pamięci z TMX
 - `DELETE /v1/memories/{name}` — usunięcie pamięci z ChromaDB
