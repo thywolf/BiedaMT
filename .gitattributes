@@ -1,0 +1,14 @@
+# Normalizuj końcówki linii: w repo LF, na Windows checkout jako CRLF
+* text=auto
+*.py text eol=crlf
+*.yaml text eol=crlf
+*.yml text eol=crlf
+*.md text eol=crlf
+*.html text eol=crlf
+*.txt text eol=crlf
+
+# Binaria
+*.png binary
+*.ico binary
+*.lnk binary
+*.gguf binary

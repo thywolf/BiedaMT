@@ -1,0 +1,33 @@
+# ── Dane właściciela — NIE publikować ────────────────────────────────────────
+# Pamięci TMX to tłumaczenia klientów (prawa autorskie) — tylko lokalnie
+memories/*
+!memories/.gitkeep
+
+# Indeks ChromaDB zbudowany z pamięci (tworzony w runtime)
+chroma/
+
+# Lokalna konfiguracja ze ścieżkami użytkownika — w repo jest config.example.yaml
+config.yaml
+
+# ── Python ───────────────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── IDE / system ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+*.lnk
+$RECYCLE.BIN/

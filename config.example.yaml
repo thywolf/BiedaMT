@@ -1,0 +1,126 @@
+# BiedaMT — przykładowa konfiguracja
+#
+# Skopiuj ten plik do config.yaml (ten sam katalog co main.py) i dostosuj ścieżki:
+#   cp config.example.yaml config.yaml   (Windows: copy config.example.yaml config.yaml)
+#
+# config.yaml jest lokalny i ignorowany przez gita (zawiera prywatne ścieżki).
+# Wszystkie ścieżki są relatywne do katalogu aplikacji (tam gdzie leży main.py)
+# albo absolutne — patrz komentarze przy poszczególnych opcjach.
+
+llama:
+  # Ścieżka do llama-server.exe (lub jeśli w PATH, samo "llama-server")
+  server_path: "llama-server"
+  # Port na którym llama-server nasłuchuje
+  port: 1234
+  # Model do załadowania — ustaw własną ścieżkę do pliku .gguf
+  model_path: "C:/models/Bielik-11B-v3.0-Instruct.Q4_K_M.gguf"
+  # Argumenty llama-server (bez ścieżki i modelu — one są powyżej)
+  args:
+    - "-c"
+    - "8192"
+    - "-ngl"
+    - "99"
+    - "-b"
+    - "512"
+    - "--threads"
+    - "8"
+    - "--threads-batch"
+    - "16"
+    - "--flash-attn"
+    - "on"
+    - "--cache-type-k"
+    - "q8_0"
+    - "--cache-type-v"
+    - "q8_0"
+    - "--parallel"
+    - "2"
+    - "--port"
+    - "1234"
+    - "--spec-ngram-mod-n-match"
+    - "24"
+    - "--spec-ngram-mod-n-min"
+    - "48"
+    - "--spec-ngram-mod-n-max"
+    - "64"
+    - "--kv-unified"
+  # Maks. czas oczekiwania na start llama-server (polling /health, sekundy)
+  startup_timeout: 60
+  # Timeout zapytań do llama-server (sekundy)
+  request_timeout: 120
+
+server:
+  # Port FastAPI
+  port: 12345
+  # 0.0.0.0 = API dostępne z sieci lokalnej; 127.0.0.1 = tylko ten komputer
+  host: "0.0.0.0"
+
+rag:
+  # Model embeddingów
+  embedding_model: "intfloat/multilingual-e5-small"
+  # cpu / cuda
+  embedding_device: "cpu"
+  # Domyślna liczba wyników wyszukiwania RAG
+  search_results: 10
+  # Wyniki z każdej pamięci przy search_all
+  search_all_per_memory: 2
+  # Cosine distance (0 = identyczne): trafienie poniżej progu = niemal identyczne,
+  # tłumaczenie wraca prosto z pamięci bez LLM (exact match działa zawsze, bez progu)
+  fuzzy_match_distance: 0.02
+  # Maks. odległość referencji branych do promptu (dalsze wyniki to szum — pomijane)
+  max_reference_distance: 0.5
+  # Maks. długość pojedynczej referencji w prompcie (znaki, dłuższe ucinane)
+  max_reference_chars: 400
+  # Glosariusz z TMX: krótkie segmenty stają się terminami wymuszanymi w prompcie
+  # (trafienie terminu = "użyj DOKŁADNIE tego tłumaczenia", nawet jeśli nie ma fuzzy)
+  terms_enabled: true
+  # Maks. liczba słów w segmencie traktowanym jako termin
+  terms_max_words: 4
+  # Minimalna długość terminu (znaki)
+  terms_min_chars: 2
+
+translation:
+  # Domyślna pamięć (nazwa pliku TMX bez rozszerzenia, lub null = wszystkie)
+  default_memory: null
+  temperature: 0.1
+  max_tokens: 1024
+
+# Szablony promptu tłumaczenia (hotkey → build_rag_prompt). Zmiany wchodzą po
+# "Reload prompt" w menu tray (albo po restarcie). Placeholdery wypełnia
+# str.format(), więc dosłowny nawias klamrowy w treści zapisz jako {{ i }}.
+prompt:
+  # Główny szablon: {src}/{tgt} — języki (EN/PL), {glossary} — blok terminów,
+  # {references} — blok referencji (oba puste, gdy brak trafień),
+  # {text} — tekst do przetłumaczenia
+  template: |
+    Jesteś profesjonalnym tłumaczem technicznym {src}->{tgt} specjalizującym się w technicznych tłumaczeniach.
+    {glossary}{references}W odpowiedzi podajesz tylko tłumaczenie poniższego tekstu, bez dodatkowego tekstu, wyjaśnień, notatek lub uwag. Teraz przetłumacz poniższy tekst:
+    {text}
+  # Nagłówek bloku glosariusza ({items} — wyrenderowane pozycje z glossary_item)
+  glossary_block: "Terminologia - dla zachowania spójności terminologicznej:\n{items}\n"
+  # Pojedynczy termin: {i} — numer, {src}/{tgt} — języki, {term} — termin źródłowy,
+  # {translation} — tłumaczenie terminu
+  glossary_item: "Termin {i}:\n{src}: {term}\n{tgt}: {translation}\n\n"
+  # Nagłówek bloku referencji ({items} — wyrenderowane pozycje z reference_item)
+  reference_block: "Referencje - dla zachowania spójności gramatycznej:\n{items}\n"
+  # Pojedyncza referencja: {i} — numer, {src}/{tgt} — języki,
+  # {source_text}/{target_text} — teksty źródłowy/docelowy wg kierunku tłumaczenia
+  reference_item: "Referencja {i}:\n{src}: {source_text}\n{tgt}: {target_text}\n\n"
+
+memories:
+  # Folder z plikami TMX (skan przy starcie; nowe pliki: Refresh memories w menu)
+  dir: "./memories"
+  # Ścieżka ChromaDB
+  chroma_path: "./chroma"
+
+ui:
+  # Hotkey do tłumaczenia (np. "`", "ctrl+shift+t")
+  hotkey: "`"
+  # Plik z regułami zamian (opcjonalny)
+  replacements_file: "./replacements.py"
+  # Ikony tray (active, busy, inactive)
+  icon_active: "./assets/corona.png"
+  icon_busy: "./assets/corona_orange.png"
+  icon_inactive: "./assets/corona_red.png"
+  icon_ico: "./assets/corona.ico"
+  app_name: "BiedaMT"
+  app_title: "BiedaMT — Tłumacz z pamięcią"

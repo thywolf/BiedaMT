@@ -1,0 +1,103 @@
+# BiedaMT
+
+Desktopowy tłumacz EN↔PL z pamięcią TMX (RAG) — jedna aplikacja: hotkey, tray, llama-server i API.
+
+## Co robi
+
+- Uruchamia w tle **llama-server** (llama.cpp) z podanym modelem i łączy się z nim
+- Ładuje pamięci TMX z folderu `memories/` do **ChromaDB** (embeddingi `intfloat/multilingual-e5-small` z prefiksami `query:`/`passage:`)
+- Rejestruje **hotkey** — po naciśnięciu: `ctrl+c` → tłumaczenie z RAG → `delete` → `ctrl+v`
+- **Exact/fuzzy match** — dokładnie lub niemal identyczne zdanie wraca prosto z pamięci TMX (natychmiast, bez LLM); reszta: referencje RAG filtrowane po podobieństwie
+- **Glosariusz z TMX** — krótkie segmenty pamięci (≤ `terms_max_words` słów) działają jak termbase: trafione w tekście terminy trafiają do promptu jako obowiązkowe tłumaczenia (spójność terminologiczna niezależnie od fuzzy)
+- Ikona w **tray** (pystray): wybór pamięci, kierunek tłumaczenia, włączenie/wyłączenie hotkeya
+- **Ładowanie pamięci na żądanie** — `Refresh memories` dopisuje nowe TMX, `Reload memory → nazwa` wymusza re-import zaktualizowanego TMX (apka nie obserwuje folderu na bieżąco)
+- GUI w przeglądarce pod `http://localhost:12345/` — lista pamięci, reload, delete
+
+## Wymagania
+
+- Windows
+- Python 3.10+
+- llama-server (llama.cpp) + model GGUF (np. Bielik)
+- Przy pierwszym starcie: pobranie modelu embeddingów (~470 MB) z HuggingFace
+
+## Instalacja
+
+```
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+copy config.example.yaml config.yaml
+```
+
+Aplikacja wymaga `config.yaml` przy starcie — bez niego nie uruchomi się.
+
+## Konfiguracja
+
+Wszystko w `config.yaml` — żadnych hardkodów w kodzie. W repo leży szablon `config.example.yaml`; `config.yaml` tworzysz z niego lokalnie i **nie commitujesz** (zawiera prywatne ścieżki do modelu i llama-servera — jest w `.gitignore`):
+
+- `llama` — ścieżka do llama-server, model, argumenty CLI, port
+- `server` — port FastAPI (domyślnie 12345)
+- `rag` — model embeddingów, device (cpu/cuda), liczba wyników, progi dopasowań (fuzzy/reference), glosariusz (`terms_*`)
+- `translation` — domyślna pamięć, temperatura, max_tokens
+- `memories` — folder TMX, ścieżka ChromaDB
+- `ui` — hotkey, ikony, nazwa apki
+
+## Uruchomienie
+
+```
+python main.py
+```
+
+## Użycie
+
+1. Skopiuj tekst (`ctrl+c` — normalnie, do schowka)
+2. Naciśnij hotkey (domyślnie backtick `` ` ``)
+3. Tekst w miejscu kursora zostanie podmieniony na tłumaczenie
+
+Menu tray:
+- **Hotkey active/inactive** — włącza/wyłącza hotkey
+- **Memory** — wybór jednej z pamięci albo "All" (szukanie we wszystkich)
+- **EN→PL / PL→EN** — kierunek tłumaczenia
+- **Reload memory** — wymusza re-import zaktualizowanego TMX do ChromaDB (submenu: wybór pamięci)
+- **Refresh memories** — przeskanowanie folderu `memories/` (dopisuje nowe)
+- **Reload replacements** — przeładowanie reguł zamian z `replacements.py`
+- **Quit** — zamyka apkę i llama-server
+
+## Pamięci TMX
+
+Wrzuć pliki `.tmx` do folderu `memories/`. Nazwa pliku (bez rozszerzenia) to nazwa pamięci. Przy pierwszym załadowaniu plik jest parsowany i indeksowany do ChromaDB — kolejne starty ładują się z cache. Format indeksu jest wersjonowany (metadane kolekcji): po zmianie logiki embeddingów pierwszy start automatycznie wykona re-import wszystkich pamięci z plików TMX. Folder nie jest obserwowany automatycznie — nowe pliki: **Refresh memories** (dopisuje nowe), zaktualizowane: **Reload memory → nazwa** (re-import TMX do ChromaDB) z menu tray.
+
+## API
+
+Dla narzędzi zewnętrznych (ogarniają systemprompt same):
+
+- `POST /v1/chat/completions` — OpenAI-compatible; jeśli ostatnia wiadomość usera zaczyna się od `\n[USER_PROMPT]\n`, do results są dokładane referencje RAG jako `\n[REFERENCES]\n{json}`
+- `GET /v1/memories` — lista pamięci
+- `POST /v1/memories/{name}/reload` — przeładowanie pamięci z TMX
+- `DELETE /v1/memories/{name}` — usunięcie pamięci z ChromaDB
+- `GET /health` — status (llama, pamięci, hotkey)
+- `GET /` — GUI
+
+## Struktura
+
+```
+BiedaMT/
+├── main.py               # cała apka: FastAPI + pystray + hotkey
+├── rag_engine.py         # TMX → ChromaDB, wyszukiwanie
+├── config.example.yaml   # szablon konfiguracji (skopiuj do config.yaml)
+├── requirements.txt
+├── replacements.py       # reguły zamian tekstowych (przed/po tłumaczeniu)
+├── memories/             # pamięci TMX (lokalne, nie w repo)
+├── chroma/               # baza ChromaDB (tworzona automatycznie, nie w repo)
+├── assets/               # ikony
+└── LICENSE               # MIT
+```
+
+## Licencja
+
+MIT — patrz [LICENSE](LICENSE). Pamięci TMX i pliki modeli pozostają własnością ich właścicieli i nie są częścią tego repozytorium.
+
+## Uwagi
+
+- Hotkey wymaga czasem uruchomienia jako administrator (zależnie od okna, w którym pracujesz)
+- Debug printy w konsoli (`🔥`, `📋`, `📖`) — można wyciszyć w razie potrzeby
