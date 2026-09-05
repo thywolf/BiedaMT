@@ -14,35 +14,10 @@ llama:
   port: 1234
   # Model do załadowania — ustaw własną ścieżkę do pliku .gguf
   model_path: "C:/models/Bielik-11B-v3.0-Instruct.Q4_K_M.gguf"
-  # Argumenty llama-server (bez ścieżki i modelu — one są powyżej)
-  args:
-    - "-c"
-    - "8192"
-    - "-ngl"
-    - "99"
-    - "-b"
-    - "512"
-    - "--threads"
-    - "8"
-    - "--threads-batch"
-    - "16"
-    - "--flash-attn"
-    - "on"
-    - "--cache-type-k"
-    - "q8_0"
-    - "--cache-type-v"
-    - "q8_0"
-    - "--parallel"
-    - "2"
-    - "--port"
-    - "1234"
-    - "--spec-ngram-mod-n-match"
-    - "24"
-    - "--spec-ngram-mod-n-min"
-    - "48"
-    - "--spec-ngram-mod-n-max"
-    - "64"
-    - "--kv-unified"
+  # Argumenty llama-server (bez ścieżki i modelu — one są powyżej).
+  # Jeden ciąg (tak zapisuje GUI) albo lista YAML — obie formy działają.
+  # Wartości ze spacjami ujmij w cudzysłów; --port zsynchronizuje się z polem "port".
+  args: "-c 8192 -ngl 99 -b 512 --threads 8 --threads-batch 16 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --parallel 2 --port 1234 --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64 --kv-unified"
   # Maks. czas oczekiwania na start llama-server (polling /health, sekundy)
   startup_timeout: 60
   # Timeout zapytań do llama-server (sekundy)

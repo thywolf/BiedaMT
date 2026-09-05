@@ -12,8 +12,14 @@ from sentence_transformers import SentenceTransformer
 # Model e5 wymaga prefiksów: "query: " dla zapytań, "passage: " dla indeksowanych dokumentów
 QUERY_PREFIX = "query"
 PASSAGE_PREFIX = "passage"
-# Znacznik wersji embeddingów w metadanych kolekcji — zmiana wymusza re-import z TMX
+# Znacznik wersji embeddingów w metadanych kolekcji — zmiana wymusza re-import z TMX.
+# Wersjonowany nazwą modelu: inny model embeddingów = niekompatybilne indeksy.
 EMBEDDING_MARKER = "e5-prefixed-v1"
+LEGACY_E5_MODEL = "intfloat/multilingual-e5-small"  # model sprzed wersjonowania nazwą
+
+def embedding_marker(embedding_model: str) -> str:
+    """Znacznik kolekcji dla danego modelu embeddingów."""
+    return f"{EMBEDDING_MARKER}:{embedding_model}"
 # Partia pobierania metadanych do glosariusza — pełny get() na dużej kolekcji
 # wywala SQLite ("too many SQL variables")
 TERM_FETCH_BATCH = 5000
@@ -90,22 +96,33 @@ class TermMatcher:
 class TMXTranslatorRAG:
     """RAG engine dla pojedynczej pamięci TMX."""
 
-    def __init__(self, client, model: SentenceTransformer, memory_name: str, tmx_path: str):
+    def __init__(self, client, model: SentenceTransformer, memory_name: str, tmx_path: str,
+                 embedding_marker: str = EMBEDDING_MARKER):
         self.client = client
         self.model = model
         self.memory_name = memory_name
         self.tmx_path = tmx_path
         self.collection_name = f"tmx_{memory_name}"
+        self.embedding_marker = embedding_marker
         self.collection = None
         self._terms_cache: Dict[str, Dict[str, str]] = {}  # src_key -> {term: tłumaczenie}
         self._terms_lock = threading.Lock()
         self._load_or_create_collection()
 
+    def _marker_matches(self, marker: Optional[str]) -> bool:
+        """Czy kolekcja jest w formacie embeddingów zgodnym z bieżącym modelem."""
+        if marker == self.embedding_marker:
+            return True
+        # Kolekcje sprzed wersjonowania nazwą modelu: ważne tylko, gdy model
+        # pozostał starym domyślnym e5 (wtedy embeddingi są te same)
+        return marker == EMBEDDING_MARKER and self.embedding_marker == embedding_marker(LEGACY_E5_MODEL)
+
     def _load_or_create_collection(self):
         try:
             self.collection = self.client.get_collection(name=self.collection_name)
-            # Kolekcje sprzed przejścia na prefiksy e5 / cosine — wymuś jednorazowy re-import
-            if (self.collection.metadata or {}).get("embedding") != EMBEDDING_MARKER:
+            # Kolekcje sprzed przejścia na prefiksy e5 / cosine / z innego modelu —
+            # wymuś jednorazowy re-import
+            if not self._marker_matches((self.collection.metadata or {}).get("embedding")):
                 print(f"🔄 Kolekcja w starym formacie embeddingów, re-import: {self.memory_name}...")
                 self.client.delete_collection(self.collection_name)
                 self.collection = None
@@ -121,7 +138,7 @@ class TMXTranslatorRAG:
         # cosine — odległość (0 = identyczne) łatwo porównywać z progami z configu
         self.collection = self.client.create_collection(
             name=self.collection_name,
-            metadata={"hnsw:space": "cosine", "embedding": EMBEDDING_MARKER},
+            metadata={"hnsw:space": "cosine", "embedding": self.embedding_marker},
         )
         try:
             with open(self.tmx_path, "rb") as f:
@@ -275,6 +292,7 @@ class RAGManager:
         self.memories_dir = memories_dir
         self.terms_min_chars = terms_min_chars
         self.terms_max_words = terms_max_words
+        self.embedding_marker = embedding_marker(embedding_model)
         self.client = chromadb.PersistentClient(path=chroma_path)
         print(f"🧠 Model embeddingów: {embedding_model} ({embedding_device})")
         self.model = SentenceTransformer(embedding_model, device=embedding_device)
@@ -301,10 +319,40 @@ class RAGManager:
                     model=self.model,
                     memory_name=memory_name,
                     tmx_path=tmx_path,
+                    embedding_marker=self.embedding_marker,
                 )
                 self.engines[memory_name] = engine
             except Exception as e:
                 print(f"❌ Błąd ładowania {memory_name}: {e}")
+
+    def warmup(self) -> None:
+        """Rozgrzej leniwe ścieżki RAG (w tle po starcie): skan glosariuszu obu
+        kierunków, zbudowanie matcherów terminów i po jednym zapytaniu HNSW na
+        pamięć (jeden wspólny embedding — pierwszy encode modelu i leniwe
+        ładowanie indeksów inaczej trafiają w pierwsze tłumaczenie)."""
+        if not self.engines:
+            return
+        try:
+            query_embedding = embed_query(self.model, "warmup")
+            for engine in self.engines.values():
+                engine.get_terms("source", "target", self.terms_min_chars, self.terms_max_words)
+                engine.get_terms("target", "source", self.terms_min_chars, self.terms_max_words)
+                engine.search("warmup", n_results=1, query_embedding=query_embedding)
+            self.get_term_matcher("en")
+            self.get_term_matcher("pl")
+            print(f"🔥 RAG rozgrzany ({len(self.engines)} pamięci)")
+        except Exception as e:
+            print(f"⚠️ Warmup RAG pominięty: {e}")
+
+    def _warmup_engine(self, engine: TMXTranslatorRAG) -> None:
+        """Rozgrzej pojedynczą pamięć po re-imporcie: skan glosariuszu obu
+        kierunków (świeży obiekt = puste cache) + leniwe ładowanie indeksu HNSW."""
+        try:
+            engine.get_terms("source", "target", self.terms_min_chars, self.terms_max_words)
+            engine.get_terms("target", "source", self.terms_min_chars, self.terms_max_words)
+            engine.search("warmup", n_results=1, query_embedding=embed_query(self.model, "warmup"))
+        except Exception as e:
+            print(f"⚠️ Warmup pamięci {engine.memory_name} pominięty: {e}")
 
     def search_all(self, query: str, n_results_per_memory: int = 2) -> List[Dict]:
         if not self.engines:
@@ -367,8 +415,10 @@ class RAGManager:
                 model=self.model,
                 memory_name=memory_name,
                 tmx_path=tmx_path,
+                embedding_marker=self.embedding_marker,
             )
             self.engines[memory_name] = engine
+            self._warmup_engine(engine)
             return True
         except Exception as e:
             print(f"❌ Błąd reloadu {memory_name}: {e}")

@@ -5,6 +5,7 @@ sentence-transformers>=3.0
 lxml>=5.0
 pydantic>=2.0
 PyYAML>=6.0
+ruamel.yaml>=0.18
 requests>=2.31
 keyboard>=0.13
 pyperclip>=1.8

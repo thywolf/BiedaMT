@@ -1,5 +1,6 @@
 """BiedaMT — all-in-one translator z pamięcią RAG."""
 import atexit
+import copy
 import importlib
 import json
 import os
@@ -11,7 +12,7 @@ import time
 from ctypes import windll
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import keyboard
 import pyperclip
@@ -25,6 +26,7 @@ from pydantic import BaseModel
 from pystray import Menu, MenuItem, Icon
 
 from rag_engine import RAGManager
+from settings_gui import RESTART_APP_KEYS, RESTART_LLAMA_KEYS, split_args_string
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -37,6 +39,66 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 CONFIG = load_config()
+
+def _merge_config_values(data: dict, new_values: dict) -> None:
+    """Wpisz nowe wartości do wczytanej mapy YAML. Niezmienione klucze zostają
+    bez dotyku (ruamel zachowa wtedy oryginalne formatowanie)."""
+    try:
+        from ruamel.yaml.scalarstring import LiteralScalarString
+    except ImportError:
+        LiteralScalarString = None
+    for section, values in new_values.items():
+        target = data.get(section)
+        if not isinstance(target, dict):
+            target = data[section] = {}
+        for key, value in values.items():
+            if key in target and target[key] == value:
+                continue
+            if LiteralScalarString is not None and isinstance(value, str) and "\n" in value:
+                value = LiteralScalarString(value)  # wielolinijkowe teksty jako blok | w YAML
+            target[key] = value
+
+def _write_config(path: Path, new_values: dict) -> None:
+    """Zapisz new_values do podanego pliku YAML, scalając z resztą zawartości.
+    Z ruamel.yaml (round-trip) komentarze i kolejność przetrwają; bez niego
+    plik jest przepisywany przez PyYAML bez komentarzy."""
+    try:
+        from ruamel.yaml import YAML
+    except ImportError:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        _merge_config_values(data or {}, new_values)
+        path.write_text(
+            yaml.dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+        print("⚠️ Brak ruamel.yaml — config.yaml przepisany bez komentarzy (pip install ruamel.yaml)")
+        return
+    if path.exists():  # kopia zapasowa przed pierwszą modyfikacją z GUI
+        backup = path.with_suffix(".yaml.bak")
+        if not backup.exists():
+            backup.write_bytes(path.read_bytes())
+    yml = YAML()
+    yml.preserve_quotes = True
+    yml.width = 4096
+    with open(path, "r", encoding="utf-8") as f:
+        data = yml.load(f) or {}
+    _merge_config_values(data, new_values)
+    with open(path, "w", encoding="utf-8") as f:
+        yml.dump(data, f)
+
+def save_config_values(new_values: dict) -> None:
+    """Zapisz wartości do config.yaml, zostawiając resztę pliku w spokoju."""
+    _write_config(Path(__file__).parent / "config.yaml", new_values)
+
+def _changed_keys(old: dict, new: dict) -> List[str]:
+    """Lista kluczy 'sekcja.pole' o zmienionej wartości (stary config vs nowy)."""
+    changed = []
+    for section, values in new.items():
+        old_section = old.get(section) or {}
+        for key, value in values.items():
+            if old_section.get(key) != value:
+                changed.append(f"{section}.{key}")
+    return changed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # State
@@ -164,6 +226,20 @@ _PROMPT_REQUIRED: Dict[str, Tuple[str, ...]] = {
     "reference_block": ("{items}",),
 }
 
+def _check_prompt_template(key: str, value: str) -> Optional[str]:
+    """Sprawdź pojedynczy szablon promptu (None = OK, str = opis błędu)."""
+    dry_args = _PROMPT_DRY_ARGS.get(key)
+    if dry_args is None:
+        return None
+    try:
+        value.format(**dry_args)
+    except Exception as e:
+        return f"błędny szablon ({e})"
+    missing = [ph for ph in _PROMPT_REQUIRED.get(key, ()) if ph not in value]
+    if missing:
+        return f"brak placeholdera {'/'.join(missing)}"
+    return None
+
 def _load_prompt_templates(cfg_prompt: Optional[dict] = None) -> Dict[str, str]:
     """Połącz szablony promptu z config.yaml (prompt.*) z domyślnymi.
     Zepsuty szablon (błąd .format / brak obowiązkowego placeholdera) = zostaje domyślny."""
@@ -172,21 +248,31 @@ def _load_prompt_templates(cfg_prompt: Optional[dict] = None) -> Dict[str, str]:
         cfg_prompt = CONFIG.get("prompt") or {}
     if not isinstance(cfg_prompt, dict):
         return templates
-    for key, dry_args in _PROMPT_DRY_ARGS.items():
+    for key in _PROMPT_DRY_ARGS:
         value = cfg_prompt.get(key)
         if not isinstance(value, str) or not value:
             continue
-        try:
-            value.format(**dry_args)
-        except Exception as e:
-            print(f"⚠️ prompt.{key}: błędny szablon ({e}) — zostaje domyślny")
-            continue
-        missing = [ph for ph in _PROMPT_REQUIRED.get(key, ()) if ph not in value]
-        if missing:
-            print(f"⚠️ prompt.{key}: brak placeholdera {'/'.join(missing)} — zostaje domyślny")
+        error = _check_prompt_template(key, value)
+        if error:
+            print(f"⚠️ prompt.{key}: {error} — zostaje domyślny")
             continue
         templates[key] = value
     return templates
+
+def validate_prompt_templates(cfg_prompt: dict) -> List[str]:
+    """Błędy w szablonach promptu — walidacja dla okna ustawień (pusta lista = OK).
+    Puste szablony są dozwolone (liczą się jak 'użyj domyślnego')."""
+    if not isinstance(cfg_prompt, dict):
+        return ["Prompt: sekcja musi być mapą klucz → szablon"]
+    errors = []
+    for key in _PROMPT_DRY_ARGS:
+        value = cfg_prompt.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        error = _check_prompt_template(key, value)
+        if error:
+            errors.append(f"prompt.{key}: {error}")
+    return errors
 
 def reload_prompt(icon=None, item=None):
     """Przeładuj szablony promptu z config.yaml (menu: Reload prompt)."""
@@ -387,15 +473,27 @@ def set_memory(name: Optional[str], *args):
     current_memory = name
     rebuild_menu()
 
+def rebind_hotkey():
+    """Przepnij hotkey wg configu (toggle w menu, zmiana w ustawieniach, nagrywanie w GUI)."""
+    try:
+        keyboard.remove_all_hotkeys()
+    except AttributeError:
+        pass  # listener biblioteki keyboard jeszcze nie wystartował = nic do usuwania
+    if hotkey_active:
+        keyboard.add_hotkey(CONFIG["ui"]["hotkey"], action, suppress=True, trigger_on_release=True)
+
+def refresh_tray_icon():
+    """Odśwież ikonę i tooltip tray wg bieżących ustawień (po zmianie w GUI)."""
+    if not icon:
+        return
+    icon.icon = Image.open(CONFIG["ui"]["icon_active" if hotkey_active else "icon_inactive"])
+    icon.title = f'{CONFIG["ui"]["app_title"]}\n{wordcount} words\n{charcount} characters'
+
 def toggle_hotkey(icon, item):
     global hotkey_active
     hotkey_active = not hotkey_active
-    if hotkey_active:
-        keyboard.add_hotkey(CONFIG["ui"]["hotkey"], action, suppress=True, trigger_on_release=True)
-        icon.icon = Image.open(CONFIG["ui"]["icon_active"])
-    else:
-        keyboard.remove_all_hotkeys()
-        icon.icon = Image.open(CONFIG["ui"]["icon_inactive"])
+    rebind_hotkey()
+    refresh_tray_icon()
     rebuild_menu()
 
 def toggle_language_en(icon, item):
@@ -412,6 +510,7 @@ def refresh_memories(icon=None, item=None):
     """Odśwież pamięci — przeskanuj folder (dopisz nowe)."""
     if rag_manager:
         rag_manager.load_all_memories()
+        rag_manager.warmup()  # świeże obiekty pamięci = puste cache glosariuszu
     rebuild_menu()
 
 def reload_memory_menu(memory_name: str, *args):
@@ -485,6 +584,8 @@ def rebuild_menu():
         MenuItem("Reload replacements", reload_replacements),
         MenuItem("Reload prompt", reload_prompt),
         Menu.SEPARATOR,
+        MenuItem("Settings", open_settings_menu),
+        Menu.SEPARATOR,
         MenuItem("Quit", exit_prg),
     )
 
@@ -497,22 +598,94 @@ def exit_prg(icon=None, item=None):
     os._exit(0)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Settings GUI (okno ustawień)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def open_settings_menu(icon=None, item=None):
+    """Akcja menu tray — otwórz okno ustawień (własny wątek Tk, pystray zostaje na głównym)."""
+    from settings_gui import open_settings
+    open_settings(
+        current=copy.deepcopy(CONFIG),
+        save_fn=save_settings,
+        validate_prompt_fn=validate_prompt_templates,
+        restart_llama_fn=restart_llama_async,
+        hotkey_pause_fn=keyboard.remove_all_hotkeys,
+        hotkey_resume_fn=rebind_hotkey,
+        config_path=Path(__file__).parent / "config.yaml",
+    )
+
+def save_settings(new_values: dict) -> dict:
+    """Zapisz ustawienia z okna GUI: config.yaml + live-apply w pamięci procesu.
+    Zwraca informację, które zmiany wymagają restartu (llama-servera / aplikacji)."""
+    global current_memory
+    old = copy.deepcopy(CONFIG)
+    changed = _changed_keys(old, new_values)
+
+    save_config_values(new_values)
+
+    # Wartości czytane przy każdym tłumaczeniu (progi, temperature, porty, timeouty)
+    # działają od razu po podmianie CONFIG; resztę przepinamy poniżej.
+    for section, values in new_values.items():
+        CONFIG.setdefault(section, {}).update(values)
+
+    if "ui.hotkey" in changed:
+        rebind_hotkey()
+    if any(k.startswith("prompt.") for k in changed):
+        reload_prompt()
+    if "ui.replacements_file" in changed:
+        load_replacements()
+    if "translation.default_memory" in changed:
+        current_memory = CONFIG["translation"]["default_memory"]
+    if any(k.startswith("ui.") for k in changed):
+        refresh_tray_icon()
+    rebuild_menu()
+
+    llama_keys = sorted(k for k in changed if k in RESTART_LLAMA_KEYS)
+    app_keys = sorted(k for k in changed if k in RESTART_APP_KEYS)
+    notes = []
+    if "rag.embedding_model" in changed:
+        notes.append("Zmiana modelu embeddingów wymusi przy restarcie ponowne indeksowanie "
+                     "pamięci z TMX (i pobranie modelu, jeśli go nie ma lokalnie).")
+    return {
+        "llama_restart": bool(llama_keys),
+        "app_restart": bool(app_keys),
+        "llama_keys": llama_keys,
+        "app_keys": app_keys,
+        "notes": notes,
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Llama server
 # ──────────────────────────────────────────────────────────────────────────────
 
+class LlamaStartError(RuntimeError):
+    """llama-server nie wystartował (zła ścieżka, crash, brak odpowiedzi /health)."""
+
 def start_llama():
-    """Uruchom llama-server jako subprocess."""
+    """Uruchom llama-server jako subprocess. Porażka podnosi LlamaStartError
+    (zamiast ubijać proces) — main() przy starcie i tak kończy bieg, a restart
+    z okna ustawień może wyświetlić błąd i działać dalej."""
     global llama_process
     llama_cfg = CONFIG["llama"]
     server_path = llama_cfg["server_path"]
-    
+
     if not os.path.exists(server_path):
         # Spróbuj z PATH
         server_path = "llama-server"
         print(f"⚠️ Nie znaleziono pod podaną ścieżką, próbuję 'llama-server' z PATH")
-    
-    args = [server_path, "-m", llama_cfg["model_path"]] + llama_cfg["args"]
-    
+
+    # Argumenty: jeden ciąg (format z GUI) albo lista YAML — oba spłaszczamy do
+    # tokenów argv wg reguł Windows (elementy listy ze spacjami też rozbijamy,
+    # więc żaden mix formatów nie trafi do llama-servera jako zepsuty token)
+    raw_args = llama_cfg["args"]
+    if isinstance(raw_args, str):
+        llama_args = split_args_string(raw_args)
+    else:
+        llama_args = []
+        for element in (raw_args or []):
+            llama_args.extend(split_args_string(str(element)))
+    args = [server_path, "-m", llama_cfg["model_path"]] + llama_args
+
     def filter_output(pipe, prefix="[llama]"):
         for line in iter(pipe.readline, ''):
             line = line.strip()
@@ -520,10 +693,10 @@ def start_llama():
                 continue
             if any(kw in line.lower() for kw in ['error', 'warning', 'eval time']):
                 print(f"{prefix} {line}")
-    
+
     print("🚀 Uruchamianie llama-server...")
     print(f"📂 Ścieżka: {server_path}")
-    
+
     try:
         llama_process = subprocess.Popen(
             args,
@@ -544,8 +717,7 @@ def start_llama():
         print(f"⏳ Czekam na llama-server (polling /health, limit {llama_cfg['startup_timeout']}s)...")
         while time.time() < deadline:
             if llama_process.poll() is not None:
-                print("❌ llama-server zakończył się nieoczekiwanie!")
-                sys.exit(1)
+                raise LlamaStartError("llama-server zakończył się podczas startu (patrz log llama)")
             try:
                 if requests.get(health_url, timeout=1).status_code == 200:
                     ready = True
@@ -555,19 +727,18 @@ def start_llama():
             time.sleep(0.25)
 
         if not ready:
-            print(f"❌ llama-server nie odpowiedział w {llama_cfg['startup_timeout']}s")
-            sys.exit(1)
+            raise LlamaStartError(f"llama-server nie odpowiedział w {llama_cfg['startup_timeout']}s")
 
         # Warmup w tle — pierwsze tłumaczenie bez opłaty startowej
         threading.Thread(target=warmup_llama, daemon=True).start()
 
         print(f"✅ llama-server uruchomiony na porcie {llama_cfg['port']}")
+    except LlamaStartError:
+        raise
     except FileNotFoundError:
-        print(f"❌ Nie znaleziono llama-server: {server_path}")
-        sys.exit(1)
+        raise LlamaStartError(f"Nie znaleziono llama-server: {server_path}")
     except Exception as e:
-        print(f"❌ Błąd uruchamiania llama-server: {e}")
-        sys.exit(1)
+        raise LlamaStartError(f"Błąd uruchamiania llama-server: {e}")
 
 def warmup_llama():
     """Rozgrzej model jednym drobnym zapytaniem (w tle, nie blokuje startu)."""
@@ -580,10 +751,10 @@ def warmup_llama():
         print("🔥 llama-server rozgrzany")
     except Exception as e:
         print(f"⚠️ Warmup pominięty: {e}")
-    # Przy okazji rozgrzej glosariusz (skan metadanych Chromy — inaczej przy pierwszym tłumaczeniu)
+    # Rozgrzej też RAG: pierwszy encode modelu, skan glosariuszu obu kierunków
+    # i leniwe ładowanie indeksów HNSW — inaczej te koszty trafiają w pierwsze tłumaczenie
     if rag_manager:
-        rag_manager.get_term_matcher("en")
-        rag_manager.get_term_matcher("pl")
+        rag_manager.warmup()
 
 def stop_llama():
     """Zatrzymaj llama-server."""
@@ -596,6 +767,28 @@ def stop_llama():
         except subprocess.TimeoutExpired:
             llama_process.kill()
         print("✅ llama-server zatrzymany")
+
+_llama_restart_lock = threading.Lock()
+
+def restart_llama_async(on_done: Callable[[], None], on_error: Callable[[str], None]) -> None:
+    """Zrestartuj llama-servera w tle (np. przycisk w oknie ustawień).
+    Callbacki wywoływane z wątku roboczego — odbiorca musi marshalingować do swojego UI."""
+    def worker():
+        if not _llama_restart_lock.acquire(blocking=False):
+            on_error("Restart llama-servera już trwa")
+            return
+        try:
+            print("🔄 Restart llama-servera (ustawienia)...")
+            stop_llama()
+            start_llama()
+            on_done()
+        except LlamaStartError as e:
+            on_error(str(e))
+        except Exception as e:
+            on_error(f"{type(e).__name__}: {e}")
+        finally:
+            _llama_restart_lock.release()
+    threading.Thread(target=worker, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app
@@ -821,7 +1014,11 @@ def main():
     )
     
     # Start llama
-    start_llama()
+    try:
+        start_llama()
+    except LlamaStartError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
     atexit.register(stop_llama)
     
     # Setup hotkey

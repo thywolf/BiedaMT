@@ -10,6 +10,7 @@ Desktopowy tłumacz EN↔PL z pamięcią TMX (RAG) — jedna aplikacja: hotkey, 
 - **Exact/fuzzy match** — dokładnie lub niemal identyczne zdanie wraca prosto z pamięci TMX (natychmiast, bez LLM); reszta: referencje RAG filtrowane po podobieństwie
 - **Glosariusz z TMX** — krótkie segmenty pamięci (≤ `terms_max_words` słów) działają jak termbase: trafione w tekście terminy trafiają do promptu jako obowiązkowe tłumaczenia (spójność terminologiczna niezależnie od fuzzy)
 - Ikona w **tray** (pystray): wybór pamięci, kierunek tłumaczenia, włączenie/wyłączenie hotkeya
+- **Okno ustawień** (`Settings` w menu tray) — cała konfiguracja z GUI: wybór plików, nagrywanie hotkeya z klawiatury, walidacja; jasno oznacza, które zmiany działają od razu, a które wymagają restartu llama-servera (przycisk „Restart LLM”) albo całej aplikacji
 - **Ładowanie pamięci na żądanie** — `Refresh memories` dopisuje nowe TMX, `Reload memory → nazwa` wymusza re-import zaktualizowanego TMX (apka nie obserwuje folderu na bieżąco)
 - GUI w przeglądarce pod `http://localhost:12345/` — lista pamięci, reload, delete
 
@@ -42,6 +43,8 @@ Wszystko w `config.yaml` — żadnych hardkodów w kodzie. W repo leży szablon 
 - `memories` — folder TMX, ścieżka ChromaDB
 - `ui` — hotkey, ikony, nazwa apki
 
+`config.yaml` możesz edytować ręcznie albo w **oknie ustawień** (`Settings` w menu tray). Zapis z okna zachowuje komentarze w pliku (ruamel.yaml) i tworzy kopię zapasową `config.yaml.bak`. Większość ustawień działa od razu (hotkey, progi RAG, temperatura, szablony promptu, timeouty); zmiany ścieżek/argumentów/portu llama wymagają kliknięcia „Restart LLM” w oknie, a port/host API, ścieżki pamięci, model embeddingów i limity terminów — restartu całej aplikacji (okno mówi, które pola).
+
 ## Uruchomienie
 
 ```
@@ -61,6 +64,8 @@ Menu tray:
 - **Reload memory** — wymusza re-import zaktualizowanego TMX do ChromaDB (submenu: wybór pamięci)
 - **Refresh memories** — przeskanowanie folderu `memories/` (dopisuje nowe)
 - **Reload replacements** — przeładowanie reguł zamian z `replacements.py`
+- **Reload prompt** — przeładowanie szablonów promptu z `config.yaml`
+- **Settings** — okno ustawień (edycja `config.yaml` z GUI, z podpowiedzią czego wymaga restart)
 - **Quit** — zamyka apkę i llama-server
 
 ## Pamięci TMX
@@ -83,6 +88,7 @@ Dla narzędzi zewnętrznych (ogarniają systemprompt same):
 ```
 BiedaMT/
 ├── main.py               # cała apka: FastAPI + pystray + hotkey
+├── settings_gui.py       # okno ustawień (tkinter, własny wątek)
 ├── rag_engine.py         # TMX → ChromaDB, wyszukiwanie
 ├── config.example.yaml   # szablon konfiguracji (skopiuj do config.yaml)
 ├── requirements.txt
