@@ -10,6 +10,10 @@ chroma/
 config.yaml
 config.yaml.bak
 
+# Stan sesji (zapamiętany wybór pamięci z tray, tworzony w runtime)
+state.json
+state.json.tmp
+
 # ── Python ───────────────────────────────────────────────────────────────────
 venv/
 .venv/

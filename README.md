@@ -39,10 +39,10 @@ Wszystko w `config.yaml` — żadnych hardkodów w kodzie. W repo leży szablon 
 - `llama` — ścieżka do llama-server, model, argumenty CLI, port, timeouty
 - `server` — port FastAPI (domyślnie 12345) i host; domyślny `0.0.0.0` = API dostępne z sieci lokalnej, `127.0.0.1` = tylko ten komputer
 - `rag` — model embeddingów, device (cpu/cuda), liczba wyników, progi dopasowań (fuzzy/reference), glosariusz (`terms_*`)
-- `translation` — domyślna pamięć, temperatura, max_tokens
+- `translation` — pamięć startowa, gdy nie ma zapisanego stanu sesji (`default_memory`; null = żadna — dalej wybór checkboxami w tray), temperatura, max_tokens
 - `prompt` — szablony promptu tłumaczenia; zmiany wchodzą po `Reload prompt` w menu tray, bez restartu
 - `memories` — folder TMX, ścieżka ChromaDB
-- `ui` — hotkey, ikony, nazwa apki, ścieżka `replacements.py`
+- `ui` — hotkey, ikony, nazwa apki, ścieżka `replacements.py` i pliku stanu (`state_file` — zapamiętany wybór pamięci z tray, JSON tworzony w runtime)
 
 Uwaga na port llama-servera: figuruje w dwóch miejscach (`llama.port` i `--port` w `llama.args`). Okno ustawień synchronizuje je przy zapisie, ale przy ręcznej edycji pliku trzeba zmienić oba.
 
@@ -62,7 +62,7 @@ python main.py
 
 Menu tray:
 - **Hotkey active/inactive** — włącza/wyłącza hotkey
-- **Memory** — wybór jednej z pamięci albo "All" (szukanie we wszystkich)
+- **Memory** — checkboxy: które pamięci mają być używane w tłumaczeniu (żadna zaznaczona = tłumaczenie bez pamięci, wszystkie = szukanie we wszystkich; etykieta pokazuje aktualny wybór). Wybór jest zapamiętywany (`ui.state_file`) i wraca po restarcie; bez zapisanego stanu startuje z `translation.default_memory` (domyślnie: bez pamięci)
 - **EN -> PL / PL -> EN** — kierunek tłumaczenia
 - **Reload memory** — wymusza re-import zaktualizowanego TMX do ChromaDB (submenu: wybór pamięci)
 - **Refresh memories** — przeskanowanie folderu `memories/` (dopisuje nowe)
@@ -83,7 +83,7 @@ Dla narzędzi zewnętrznych — klient ustawia własny system prompt. API nie ma
 - `GET /v1/memories` — lista pamięci
 - `POST /v1/memories/{name}/reload` — przeładowanie pamięci z TMX
 - `DELETE /v1/memories/{name}` — usunięcie pamięci z ChromaDB
-- `GET /health` — status (llama, pamięci, hotkey)
+- `GET /health` — status (llama, pamięci, hotkey, wybór pamięci do tłumaczenia: `selected_memories`, `null` = wszystkie)
 - `GET /` — GUI
 
 ## Struktura

@@ -3,7 +3,7 @@ import os
 import re
 import hashlib
 import threading
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Iterable, Optional, Tuple
 from lxml import etree
 
 import chromadb
@@ -354,45 +354,52 @@ class RAGManager:
         except Exception as e:
             print(f"⚠️ Warmup pamięci {engine.memory_name} pominięty: {e}")
 
-    def search_all(self, query: str, n_results_per_memory: int = 2) -> List[Dict]:
-        if not self.engines:
-            return []
-        # jedno embedowanie zapytania dla wszystkich pamięci
-        query_embedding = embed_query(self.model, query)
-        all_results = []
-        for name, engine in self.engines.items():
-            results = engine.search(query, n_results=n_results_per_memory, query_embedding=query_embedding)
-            all_results.extend(results)
-        return all_results
+    def resolve_engines(self, memories: Optional[Iterable[str]] = None) -> List[TMXTranslatorRAG]:
+        """Silniki dla bieżącego wyboru pamięci: None = wszystkie, zbiór nazw = te pamięci.
+        Nazwy bez silnika (usunięta pamięć) są pomijane."""
+        if memories is None:
+            return list(self.engines.values())
+        selected = set(memories)
+        return [engine for name, engine in self.engines.items() if name in selected]
 
-    def exact_lookup(self, text: str, source_lang: str, memory: Optional[str] = None) -> Optional[str]:
-        """Dokładne trafienie w pamięci — gotowe tłumaczenie bez LLM (lub None)."""
+    def search_selected(self, query: str, memories: Optional[Iterable[str]] = None,
+                        n_results: int = 10, n_results_per_memory: int = 2) -> List[Dict]:
+        """Wyszukiwanie w wybranych pamięciach. Jedna pamięć = głębiej (n_results),
+        kilka = po n_results_per_memory z każdej (jedno embedowanie zapytania)."""
+        engines = self.resolve_engines(memories)
+        if not engines:
+            return []
+        if len(engines) == 1:
+            return engines[0].search(query, n_results=n_results)
+        query_embedding = embed_query(self.model, query)
+        results: List[Dict] = []
+        for engine in engines:
+            results.extend(engine.search(query, n_results=n_results_per_memory,
+                                         query_embedding=query_embedding))
+        return results
+
+    def exact_lookup(self, text: str, source_lang: str,
+                     memories: Optional[Iterable[str]] = None) -> Optional[str]:
+        """Dokładne trafienie w wybranych pamięciach — gotowe tłumaczenie bez LLM (lub None)."""
         if source_lang == "en":
             src_key, tgt_key = "source", "target"
         else:
             src_key, tgt_key = "target", "source"
-        if memory and memory in self.engines:
-            engines = [self.engines[memory]]
-        else:
-            engines = list(self.engines.values())
-        for engine in engines:
+        for engine in self.resolve_engines(memories):
             hit = engine.exact_lookup(text, src_key, tgt_key)
             if hit is not None:
                 return hit
         return None
 
-    def get_term_matcher(self, source_lang: str, memory: Optional[str] = None) -> Optional[TermMatcher]:
-        """Matcher termów dla kierunku (pamięć wybrana = terminy tylko z niej)."""
+    def get_term_matcher(self, source_lang: str,
+                         memories: Optional[Iterable[str]] = None) -> Optional[TermMatcher]:
+        """Matcher termów dla kierunku (wybrane pamięci = terminy tylko z nich)."""
         if source_lang == "en":
             src_key, tgt_key = "source", "target"
         else:
             src_key, tgt_key = "target", "source"
-        if memory and memory in self.engines:
-            engines = [self.engines[memory]]
-        else:
-            engines = list(self.engines.values())
         combined: Dict[str, str] = {}
-        for engine in engines:
+        for engine in self.resolve_engines(memories):
             terms = engine.get_terms(src_key, tgt_key, self.terms_min_chars, self.terms_max_words)
             combined.update(terms)
         combined = {t: tgt for t, tgt in combined.items() if tgt}

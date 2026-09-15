@@ -12,7 +12,7 @@ import time
 from ctypes import windll
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Set, Tuple
 
 import keyboard
 import pyperclip
@@ -104,13 +104,65 @@ def _changed_keys(old: dict, new: dict) -> List[str]:
 # State
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _selection_from_config(value) -> Set[str]:
+    """Pamięć startowa z config.yaml: null = żadna, nazwa = tylko ta.
+    (Stan sesji z pliku stanu ma pierwszeństwo — patrz `_initial_selection`.)"""
+    if isinstance(value, str) and value.strip():
+        return {value.strip()}
+    if value:
+        print(f"⚠️ translation.default_memory: oczekiwana nazwa pamięci lub null, ignoruję {value!r}")
+    return set()
+
+def _state_path() -> Path:
+    """Ścieżka pliku stanu sesji (względna wg katalogu apki, jak config.yaml).
+    Brak klucza w configu (starsza kopia pliku) = domyślna nazwa."""
+    path = Path(CONFIG["ui"].get("state_file") or "./state.json")
+    return path if path.is_absolute() else Path(__file__).parent / path
+
+def _read_state() -> dict:
+    """Stan sesji z pliku (brak pliku / uszkodzony JSON = pusty stan, nie wywalamy apki)."""
+    path = _state_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ Nie udało się wczytać stanu ({path.name}): {e}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _save_selection(names: Optional[Set[str]]) -> None:
+    """Zapamiętaj wybór pamięci między startami (None = wszystkie, pusty zbiór = żadna)."""
+    path = _state_path()
+    payload = {"selected_memories": sorted(names) if names is not None else None}
+    tmp = path.parent / (path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)  # atomowo — przerwany zapis nie zostawia pustego JSON-a
+    except Exception as e:
+        print(f"⚠️ Nie udało się zapisać stanu ({path}): {e}")
+
+def _initial_selection() -> Optional[Set[str]]:
+    """Wybór pamięci na start: ostatnio zapisany w pliku stanu, a gdy go nie ma —
+    translation.default_memory z configu (null = żadna pamięć)."""
+    state = _read_state()
+    if "selected_memories" in state:
+        value = state["selected_memories"]
+        if value is None:
+            return None  # komplet checkboxów z ostatniej sesji = wszystkie pamięci
+        if isinstance(value, list):
+            return {str(name) for name in value}
+        print(f"⚠️ {_state_path().name}: nieprawidłowy wybór pamięci {value!r} — ignoruję")
+    return _selection_from_config(CONFIG["translation"]["default_memory"])
+
 rag_manager: Optional[RAGManager] = None
 llama_process: Optional[subprocess.Popen] = None
 session = requests.Session()
 
 # UI state
 hotkey_active = True
-current_memory: Optional[str] = CONFIG["translation"]["default_memory"]
+# Pamięci używane w tłumaczeniu: None = wszystkie dostępne, pusty zbiór = żadna
+selected_memories: Optional[Set[str]] = _initial_selection()
 state_en = True  # True = EN->PL, False = PL->EN
 wordcount = 0
 charcount = 0
@@ -182,11 +234,11 @@ def _normalize_case(source: str, target: str) -> str:
         return target.upper()
     return target
 
-def find_terms(text: str, source_lang: str, memory: Optional[str]) -> List[Tuple[str, str]]:
+def find_terms(text: str, source_lang: str, memories: Optional[Collection[str]]) -> List[Tuple[str, str]]:
     """Znajdź terminy glosariusza (z TMX) w tekście do przetłumaczenia."""
     if not CONFIG["rag"].get("terms_enabled", True) or not rag_manager:
         return []
-    matcher = rag_manager.get_term_matcher(source_lang, memory)
+    matcher = rag_manager.get_term_matcher(source_lang, memories)
     if not matcher:
         return []
     raw_terms = matcher.find(text)
@@ -343,15 +395,16 @@ def filter_references(refs: List[Dict]) -> List[Dict]:
 # Translation
 # ──────────────────────────────────────────────────────────────────────────────
 
-def translate_with_rag(text: str, memory: Optional[str] = None,
+def translate_with_rag(text: str, memories: Optional[Collection[str]] = None,
                        source_lang: str = "en", target_lang: str = "pl") -> str:
-    """Tłumaczenie z RAG — exact/fuzzy match z pamięci -> referencje -> llama-server."""
+    """Tłumaczenie z RAG — exact/fuzzy match z pamięci -> referencje -> llama-server.
+    memories: None = wszystkie pamięci, zbiór nazw = tylko te, pusty zbiór = bez pamięci."""
     llama_url = f"http://127.0.0.1:{CONFIG['llama']['port']}/v1/chat/completions"
     print(f"  🔗 URL: {llama_url}")
 
     # 1) Exact match w pamięci — gotowe tłumaczenie bez LLM
     if rag_manager:
-        exact = rag_manager.exact_lookup(text, source_lang, memory)
+        exact = rag_manager.exact_lookup(text, source_lang, memories)
         if exact is not None:
             print(f"  🎯 Exact match (pamięć) — bez LLM: {exact[:60]}...")
             return exact
@@ -359,10 +412,11 @@ def translate_with_rag(text: str, memory: Optional[str] = None,
     # 2) Wyszukiwanie podobnych (referencje z odległościami cosine)
     similar = []
     if rag_manager:
-        if memory and memory in rag_manager.engines:
-            similar = rag_manager.engines[memory].search(text, n_results=CONFIG["rag"]["search_results"])
-        else:
-            similar = rag_manager.search_all(text, n_results_per_memory=CONFIG["rag"]["search_all_per_memory"])
+        similar = rag_manager.search_selected(
+            text, memories,
+            n_results=CONFIG["rag"]["search_results"],
+            n_results_per_memory=CONFIG["rag"]["search_all_per_memory"],
+        )
     similar = filter_references(similar)
 
     # 3) Fuzzy match — trafienie niemal identyczne, bierzemy tłumaczenie z pamięci
@@ -373,7 +427,7 @@ def translate_with_rag(text: str, memory: Optional[str] = None,
         return hit
 
     # 4) Terminy z glosariusza (krótkie segmenty TMX) — trafiają do promptu jako obowiązkowe
-    glossary = find_terms(text, source_lang, memory)
+    glossary = find_terms(text, source_lang, memories)
     if glossary:
         print(f"  📖 Terminy: {', '.join(f'{s} -> {t}' for s, t in glossary)}")
 
@@ -447,8 +501,8 @@ def action():
             target = f"{result[2].replace('.', ',')} {result[1]}"
             print(f"🔢 Pattern match: {target}")
         else:
-            print(f"🤖 Tłumaczenie przez RAG (memory={current_memory})...")
-            target = translate_with_rag(source, current_memory, source_lang, target_lang)
+            print(f"🤖 Tłumaczenie przez RAG (pamięci: {_memory_label()})...")
+            target = translate_with_rag(source, selected_memories, source_lang, target_lang)
             print(f"🤖 Wynik: {target[:80]}...")
     except Exception as err:
         print(f"❌ BŁĄD: {type(err).__name__}: {err}")
@@ -467,10 +521,45 @@ def action():
 # Tray menu
 # ──────────────────────────────────────────────────────────────────────────────
 
-def set_memory(name: Optional[str], *args):
-    """Ustaw aktualną pamięć (*args — pystray dodaje icon, item)."""
-    global current_memory
-    current_memory = name
+def _available_memories() -> Set[str]:
+    """Nazwy dostępnych pamięci."""
+    return set(rag_manager.engines.keys()) if rag_manager else set()
+
+def _is_memory_selected(name: str) -> bool:
+    """Czy pamięć bierze udział w tłumaczeniu (None = wszystkie, też doładowane później)."""
+    return selected_memories is None or name in selected_memories
+
+def _memory_label() -> str:
+    """Etykieta wyboru pamięci (tray labels po angielsku)."""
+    if selected_memories is None:
+        return "All"
+    if not selected_memories:
+        return "(none)"
+    return ", ".join(sorted(selected_memories))
+
+def _prune_selected_memories() -> None:
+    """Wypisz z wyboru pamięci, których nie ma na liście (usunięty TMX/kolekcja).
+    Wołane po starcie RAG — stan sesji może wskazywać na pamięci sprzed usunięcia."""
+    global selected_memories
+    if selected_memories is None or not rag_manager:
+        return
+    available = _available_memories()
+    if not selected_memories <= available:
+        selected_memories &= available
+
+def toggle_memory(name: str, *args):
+    """Zaznacz/odznacz pamięć w wyborze (*args — pystray dodaje icon, item)."""
+    global selected_memories
+    available = _available_memories()
+    # Nazwy bez silnika (usunięta pamięć) wypadają przy pierwszym kliknięciu
+    chosen = set(available) if selected_memories is None else set(selected_memories) & available
+    if name in chosen:
+        chosen.discard(name)
+    else:
+        chosen.add(name)
+    # Komplet zaznaczonych = None, żeby nowe pamięci (Refresh memories) wchodziły same
+    selected_memories = None if chosen >= available else chosen
+    _save_selection(selected_memories)
     rebuild_menu()
 
 def rebind_hotkey():
@@ -521,26 +610,19 @@ def reload_memory_menu(memory_name: str, *args):
     rebuild_menu()
 
 def get_memory_menu() -> Menu:
-    """Dynamiczne menu wyboru pamięci."""
+    """Dynamiczne menu wyboru pamięci — checkboxy, wiele naraz."""
     items = []
     if rag_manager:
         for name in sorted(rag_manager.engines.keys()):
             items.append(
                 MenuItem(
                     name,
-                    partial(set_memory, name),
-                    checked=lambda item, n=name: current_memory == n,
-                    radio=True,
+                    partial(toggle_memory, name),
+                    checked=lambda item, n=name: _is_memory_selected(n),
                 )
             )
-    items.append(
-        MenuItem(
-            "All",
-            partial(set_memory, None),
-            checked=lambda item: current_memory is None,
-            radio=True,
-        )
-    )
+    if not items:
+        items.append(MenuItem("(no memories)", None, enabled=False))
     return Menu(*items)
 
 def get_reload_menu() -> Menu:
@@ -565,7 +647,7 @@ def rebuild_menu():
             default=True,
         ),
         MenuItem(
-            lambda text: "Memory: " + (current_memory or "All"),
+            lambda text: "Memory: " + _memory_label(),
             get_memory_menu(),
         ),
         MenuItem(
@@ -617,7 +699,7 @@ def open_settings_menu(icon=None, item=None):
 def save_settings(new_values: dict) -> dict:
     """Zapisz ustawienia z okna GUI: config.yaml + live-apply w pamięci procesu.
     Zwraca informację, które zmiany wymagają restartu (llama-servera / aplikacji)."""
-    global current_memory
+    global selected_memories
     old = copy.deepcopy(CONFIG)
     changed = _changed_keys(old, new_values)
 
@@ -635,9 +717,12 @@ def save_settings(new_values: dict) -> dict:
     if "ui.replacements_file" in changed:
         load_replacements()
     if "translation.default_memory" in changed:
-        current_memory = CONFIG["translation"]["default_memory"]
+        selected_memories = _selection_from_config(CONFIG["translation"]["default_memory"])
+        _save_selection(selected_memories)
     if any(k.startswith("ui.") for k in changed):
         refresh_tray_icon()
+    if "ui.state_file" in changed:
+        _save_selection(selected_memories)  # nowa ścieżka od razu dostaje bieżący wybór
     rebuild_menu()
 
     llama_keys = sorted(k for k in changed if k in RESTART_LLAMA_KEYS)
@@ -888,10 +973,13 @@ async def chat_completions(request: ChatCompletionRequest):
     
     similar = []
     if source_text and rag_manager:
-        if request.rag_memory and request.rag_memory in rag_manager.engines:
-            similar = rag_manager.engines[request.rag_memory].search(source_text, n_results=CONFIG["rag"]["search_results"])
-        else:
-            similar = rag_manager.search_all(source_text, n_results_per_memory=CONFIG["rag"]["search_all_per_memory"])
+        # rag_memory nieznanej pamięci = brak filtra (zgodnie z dotychczasowym API)
+        memories = {request.rag_memory} if request.rag_memory in rag_manager.engines else None
+        similar = rag_manager.search_selected(
+            source_text, memories,
+            n_results=CONFIG["rag"]["search_results"],
+            n_results_per_memory=CONFIG["rag"]["search_all_per_memory"],
+        )
     similar = filter_references(similar)
     
     rag_prompt = build_rag_chatmessage(similar)
@@ -976,7 +1064,7 @@ async def health():
         "status": "running",
         "llama_server": lm_status,
         "memories": list(rag_manager.engines.keys()) if rag_manager else [],
-        "current_memory": current_memory,
+        "selected_memories": sorted(selected_memories) if selected_memories is not None else None,
         "hotkey_active": hotkey_active,
     }
 
@@ -1012,6 +1100,10 @@ def main():
         terms_min_chars=CONFIG["rag"]["terms_min_chars"],
         terms_max_words=CONFIG["rag"]["terms_max_words"],
     )
+    
+    # Wybór pamięci z poprzedniej sesji — nazwy, których już nie ma, wypadają
+    _prune_selected_memories()
+    print(f"📌 Wybór pamięci: {_memory_label()}")
     
     # Start llama
     try:

@@ -93,8 +93,9 @@ FIELD_SECTIONS: Tuple[Section, ...] = (
         key="translation", title="Tłumaczenie", icon="🌐",
         note="Wszystko w tej sekcji działa od razu po zapisaniu.",
         fields=(
-            Field("default_memory", "Domyślna pamięć", kind="memory",
-                  hint="„(wszystkie)” = szukaj w każdej pamięci; wybór w tray nadpisuje to na czas sesji"),
+            Field("default_memory", "Pamięć startowa", kind="memory",
+                  hint="Pamięć zaznaczona, gdy nie ma jeszcze zapisanego stanu sesji („(żadna)” = start bez "
+                       "pamięci). Wybór checkboxami w tray jest zapamiętywany i wraca po restarcie"),
             Field("temperature", "Temperatura", kind="float", vmin=0.0, vmax=2.0,
                   hint="0.0–2.0; niższa = bardziej przewidywalne tłumaczenie"),
             Field("max_tokens", "Maks. tokenów odpowiedzi", kind="int", vmin=1),
@@ -106,9 +107,10 @@ FIELD_SECTIONS: Tuple[Section, ...] = (
              "(„↻ restart”) wymagają restartu aplikacji — zmiana modelu wymusi dodatkowo ponowne "
              "indeksowanie pamięci z TMX przy starcie.",
         fields=(
-            Field("search_results", "Wyników z wybranej pamięci", kind="int", vmin=1,
-                  hint="Liczba referencji RAG, gdy w tray wybrano konkretną pamięć"),
-            Field("search_all_per_memory", "Wyników na pamięć (tryb All)", kind="int", vmin=1),
+            Field("search_results", "Wyników z jednej pamięci", kind="int", vmin=1,
+                  hint="Liczba referencji RAG, gdy tłumaczenie idzie po jednej pamięci"),
+            Field("search_all_per_memory", "Wyników na pamięć (wiele pamięci)", kind="int", vmin=1,
+                  hint="Gdy pamięci jest kilka (np. zaznaczone wszystkie), z każdej branych jest tyle wyników"),
             Field("fuzzy_match_distance", "Próg fuzzy match", kind="float", vmin=0.0, vmax=1.0,
                   hint="Odległość cosine (0 = identyczne); trafienie poniżej progu zwraca tłumaczenie "
                        "prosto z pamięci, bez LLM"),
@@ -171,6 +173,9 @@ FIELD_SECTIONS: Tuple[Section, ...] = (
                   hint='Np. "`", "ctrl+shift+t" — „Nagraj” przechwytuje kombinację z klawiatury'),
             Field("replacements_file", "Plik reguł zamian", kind="path",
                   hint="Reguły regex stosowane przed i po tłumaczeniu"),
+            Field("state_file", "Plik stanu sesji", kind="str",
+                  hint="JSON z zapamiętanym wyborem pamięci z tray (tworzony automatycznie przy pierwszym "
+                       "kliknięciu checkboxa)"),
             Field("icon_active", "Ikona — aktywny", kind="path", file_patterns=PNG_PATTERNS),
             Field("icon_busy", "Ikona — przetwarzanie", kind="path", file_patterns=PNG_PATTERNS),
             Field("icon_inactive", "Ikona — nieaktywny", kind="path", file_patterns=PNG_PATTERNS),
@@ -266,7 +271,7 @@ C_BADGE_LIVE_BG = "#dcfce7"
 C_BADGE_LIVE_FG = "#15803d"
 C_DANGER = "#ea580c"
 
-ALL_MEMORY = "(wszystkie)"
+NO_MEMORY = "(żadna)"
 BADGE_TEXT = {"llama": "↻ LLM", "app": "↻ restart", "": "● live"}
 BADGE_COLORS = {
     "llama": (C_BADGE_RESTART_BG, C_BADGE_RESTART_FG),
@@ -555,7 +560,7 @@ class SettingsWindow:
             elif f.kind == "memory":
                 choices = self._memory_choices(value)
                 widget = ttk.Combobox(widget_row, textvariable=var, values=choices, state="readonly")
-                var.set(ALL_MEMORY if value is None else str(value))
+                var.set(NO_MEMORY if value is None else str(value))
             else:
                 widget = ttk.Entry(widget_row, textvariable=var, width=52)
             widget.grid(row=0, column=0, sticky="ew")
@@ -629,7 +634,7 @@ class SettingsWindow:
             pass
         if current and current not in names:
             names.append(str(current))
-        return [ALL_MEMORY] + names
+        return [NO_MEMORY] + names
 
     def _pick_path(self, f: Field, var: tk.StringVar):
         base = self.config_path.parent
@@ -684,7 +689,7 @@ class SettingsWindow:
                 var = self._vars.get(key)
                 if var is not None:
                     raw = var.get()
-                    target[f.key] = None if raw == ALL_MEMORY else raw
+                    target[f.key] = None if raw == NO_MEMORY else raw
             elif f.kind in ("int", "float"):
                 var = self._vars.get(key)
                 if var is not None:

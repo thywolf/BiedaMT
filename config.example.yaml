@@ -34,9 +34,9 @@ rag:
   embedding_model: "intfloat/multilingual-e5-small"
   # cpu / cuda
   embedding_device: "cpu"
-  # Domyślna liczba wyników wyszukiwania RAG
+  # Liczba wyników wyszukiwania RAG, gdy tłumaczenie idzie po jednej pamięci
   search_results: 10
-  # Wyniki z każdej pamięci przy search_all
+  # Wyniki z każdej pamięci, gdy tłumaczenie idzie po wielu pamięciach naraz
   search_all_per_memory: 2
   # Cosine distance (0 = identyczne): trafienie poniżej progu = niemal identyczne,
   # tłumaczenie wraca prosto z pamięci bez LLM (exact match działa zawsze, bez progu)
@@ -54,7 +54,8 @@ rag:
   terms_min_chars: 2
 
 translation:
-  # Domyślna pamięć (nazwa pliku TMX bez rozszerzenia, lub null = wszystkie)
+  # Pamięć zaznaczona na start, gdy nie ma jeszcze zapisanego stanu sesji
+  # (nazwa pliku TMX bez rozszerzenia, lub null = żadna pamięć; wybór w tray jest zapamiętywany)
   default_memory: null
   temperature: 0.1
   max_tokens: 1024
@@ -92,6 +93,8 @@ ui:
   hotkey: "`"
   # Plik z regułami zamian (opcjonalny)
   replacements_file: "./replacements.py"
+  # Plik stanu sesji — zapamiętany wybór pamięci z tray (JSON, tworzony w runtime)
+  state_file: "./state.json"
   # Ikony tray (active, busy, inactive)
   icon_active: "./assets/corona.png"
   icon_busy: "./assets/corona_orange.png"
