@@ -19,6 +19,7 @@ import pyperclip
 import requests
 import yaml
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -959,9 +960,115 @@ async def root():
     </html>
     """
 
+# Znaczniki sekcji w promptach klientów (np. plugin Trados): linia typu [SOURCE]
+_SECTION_TAG_RE = re.compile(r"(?m)^[ \t]*\[[A-Z][A-Z0-9_ ]{0,32}\]")  # także '[TARGET] tekst' w jednej linii
+_SOURCE_TAG_RE = re.compile(r"(?im)^[ \t]*\[[ \t]*SOURCE[ \t]*\][ \t]*$")
+_SOURCE_TAG_LOOSE_RE = re.compile(r"\[[ \t]*SOURCE[ \t]*\]", re.IGNORECASE)
+# Prompt zaczynający się od tych sekcji nie niesie tekstu źródłowego
+_TARGET_SECTION_TAGS = {"TARGET", "TRANSLATION", "OUTPUT"}
+
+
+def _extract_tagged_source(text: str) -> Optional[str]:
+    """Tekst z sekcji ``[SOURCE]`` — do następnego znacznika ``[XYZ]``.
+
+    Prompty klientów często niosą po tekście kolejne sekcje (``[TARGET]``,
+    ``[INSTRUCTIONS]``, ...), więc bierzemy tylko zawartość ``[SOURCE]``.
+    Wzorzec końca sekcji nie zna z góry nazw znaczników — każda linia
+    w formacie ``[WIELKIE_LITERY]`` zamyka tekst źródłowy.
+    Zwraca None, gdy tekstu nie da się rozpoznać (brak znacznika)."""
+    match = _SOURCE_TAG_RE.search(text) or _SOURCE_TAG_LOOSE_RE.search(text)
+    if not match:
+        return None
+    rest = text[match.end():]
+    end = _SECTION_TAG_RE.search(rest)
+    return rest[:end.start()] if end else rest
+
+
+def _translate_source_from_messages(messages: List[ChatMessage]) -> Optional[str]:
+    """Tekst do przetłumaczenia z wiadomości klienta.
+
+    Protokół klienta (np. plugin Trados) to własny system prompt i wiadomość
+    user zaczynająca się od ``\\n[USER_PROMPT]\\n`` — reszta to śmieci, które
+    nowy endpoint celowo ignoruje. Z tej reszty bierzemy tylko sekcję
+    ``[SOURCE]``; bez niej cały tekst po znaczniku (z ostrzeżeniem w logu).
+    Bez znacznika ``[USER_PROMPT]`` bierzemy ostatnią wiadomość usera."""
+    raw = None
+    for msg in messages:
+        if msg.role == 'user' and msg.content.startswith('\n[USER_PROMPT]\n'):
+            raw = msg.content.split('\n[USER_PROMPT]\n', 1)[1]
+            break
+    if raw is None:
+        for msg in reversed(messages):
+            if msg.role == 'user':
+                raw = msg.content
+                break
+    if raw is None:
+        return None
+    tagged = _extract_tagged_source(raw)
+    if tagged is not None:
+        return tagged
+    # Brak [SOURCE]: prompt zaczynający się od sekcji docelowej nie ma czego tłumaczyć
+    head = _SECTION_TAG_RE.match(raw.lstrip("\r\n \t"))
+    if head and head.group(0).strip(" \t[]").upper() in _TARGET_SECTION_TAGS:
+        print("⚠️ API: prompt bez [SOURCE], zaczyna się od sekcji docelowej — brak tekstu do tłumaczenia")
+        return None
+    print("⚠️ API: brak sekcji [SOURCE] w prompcie klienta — biorę cały tekst po [USER_PROMPT]")
+    return raw
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    """Endpoint kompatybilny z OpenAI (z RAG)."""
+    """Tłumaczenie dokładnie tą samą ścieżką co hotkey (`translate_with_rag`).
+
+    Prompty klienta (system i user) są ignorowane — liczy się tylko tekst do
+    przetłumaczenia. Kierunek tłumaczenia, wybór pamięci z tray, referencje RAG,
+    glosariusz i szablony promptu pochodzą z bieżącego stanu aplikacji, nie
+    z requestu. `temperature`, `max_tokens` i `rag_memory` też są ignorowane
+    (request.model wraca tylko jako echo w odpowiedzi). Odpowiedź zachowuje
+    format OpenAI, żeby klienci działali bez zmian."""
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="No messages provided")
+
+    source_text = _translate_source_from_messages(request.messages)
+    if source_text is None or not source_text.strip():
+        raise HTTPException(status_code=400, detail="No text to translate")
+
+    # Otaczające białe znaki psułyby exact match w TMX, a nic nie wnoszą
+    source_text = source_text.strip()
+    source_lang = 'en' if state_en else 'pl'
+    target_lang = 'pl' if state_en else 'en'
+    # Kopia zbioru — toggle w tray może podmienić global w trakcie tłumaczenia
+    memories = set(selected_memories) if selected_memories is not None else None
+    if request.rag_memory:
+        print(f"⚠️ API: rag_memory={request.rag_memory!r} pominięte — używam wyboru z tray ({_memory_label()})")
+    print(f"🔌 API: {source_lang}->{target_lang}, pamięci: {_memory_label()}, "
+          f"{len(source_text)} znaków: {source_text[:80]!r}")
+
+    try:
+        # RAG i llama-server blokują — nie trzymamy pętli eventowej uvicorna
+        translation = await run_in_threadpool(
+            translate_with_rag, source_text, memories, source_lang, target_lang)
+    except Exception as e:
+        print(f"❌ API: błąd tłumaczenia: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Translation error: {e}")
+
+    if request.stream:
+        # Strumieniowanie nieobsługiwane — cała odpowiedź, jak w starym endpoincie
+        print("⚠️ API: stream=True zignorowane, zwracam pełną odpowiedź")
+
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": request.model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": translation}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+@app.post("/v1/chat/completions_old")
+async def chat_completions_old(request: ChatCompletionRequest):
+    """Archiwum starego endpointu: prompty i referencje idą do llama-servera
+    bez zmian (`[USER_PROMPT]` + `[REFERENCES]`), bez ścieżki translate_with_rag."""
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages provided")
     
@@ -997,7 +1104,7 @@ async def chat_completions(request: ChatCompletionRequest):
         "cache_prompt": True,
         "stream": False,
     }
-    
+    print(lm_payload)
     try:
         response = session.post(llama_url, json=lm_payload, timeout=CONFIG["llama"]["request_timeout"])
         response.raise_for_status()

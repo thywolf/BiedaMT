@@ -79,7 +79,8 @@ Wrzuć pliki `.tmx` do folderu `memories/`. Nazwa pliku (bez rozszerzenia) to na
 
 Dla narzędzi zewnętrznych — klient ustawia własny system prompt. API nie ma żadnego uwierzytelniania, więc przy domyślnym `host: 0.0.0.0` każdy komputer w sieci lokalnej może z niego korzystać i zarządzać pamięciami; jeśli to problem, ustaw `server.host: 127.0.0.1`.
 
-- `POST /v1/chat/completions` — OpenAI-compatible; jeśli wiadomość usera zaczyna się od `\n[USER_PROMPT]\n`, tuż przed nią wstawiana jest osobna wiadomość `\n[REFERENCES]\n{json}` z trafieniami RAG. Bez tego znacznika zapytanie idzie do llama-servera bez RAG. Opcjonalne pole `rag_memory` ogranicza wyszukiwanie do jednej pamięci (brak = wszystkie)
+- `POST /v1/chat/completions` — format odpowiedzi OpenAI-compatible, ale tłumaczy dokładnie tą samą ścieżką co hotkey (`translate_with_rag`): prompty klienta (system i user) są ignorowane, liczy się tylko sekcja `[SOURCE]` z tekstu po `\n[USER_PROMPT]\n` (kończy ją kolejny znacznik, np. `[TARGET]`; bez `[SOURCE]`: cały tekst po znaczniku, bez `[USER_PROMPT]`: ostatnia wiadomość usera). Pamięci, kierunek, referencje, glosariusz i szablony promptu biorą się z bieżącego stanu aplikacji (tray), a `temperature`, `max_tokens` i `rag_memory` z requestu są ignorowane
+- `POST /v1/chat/completions_old` — archiwum poprzedniego zachowania: prompty klienta lecą do llama-servera, a przy znaczniku `\n[USER_PROMPT]\n` przed wiadomością wstawiana jest osobna wiadomość `\n[REFERENCES]\n{json}` z trafieniami RAG; opcjonalne `rag_memory` ogranicza wyszukiwanie do jednej pamięci
 - `GET /v1/memories` — lista pamięci
 - `POST /v1/memories/{name}/reload` — przeładowanie pamięci z TMX
 - `DELETE /v1/memories/{name}` — usunięcie pamięci z ChromaDB
