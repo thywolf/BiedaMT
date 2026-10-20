@@ -1,11 +1,23 @@
-# Normalizuj końcówki linii: w repo LF, na Windows checkout jako CRLF
+# Normalizuj końcówki linii: w repo LF, w working tree CRLF
 * text=auto
+
+# Źródła i dokumentacja — po klonie zawsze CRLF, niezależnie od core.autocrlf
 *.py text eol=crlf
 *.yaml text eol=crlf
 *.yml text eol=crlf
 *.md text eol=crlf
 *.html text eol=crlf
 *.txt text eol=crlf
+
+# Skrypty Windows — LF potrafi zepsuć etykiety w .bat/.cmd, więc wymuszamy CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.reg text eol=crlf
+
+# Pliki samego gita — zawsze LF, żeby nie zależały od ustawień maszyny
+.gitattributes text eol=lf
+.gitignore text eol=lf
 
 # Binaria
 *.png binary
