@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import keyboard
+import yaml
 
 try:
     import tkinter as tk
@@ -43,7 +44,7 @@ except ImportError:
 class Field:
     key: str
     label: str
-    kind: str = "str"          # str|int|float|bool|combo|path|dir|args|text|hotkey|memory
+    kind: str = "str"          # str|secret|int|float|bool|combo|path|dir|args|text|hotkey|memory
     hint: str = ""             # podpowiedź pod polem
     restart: str = ""          # "" = live | "llama" = restart llama-servera | "app" = restart apki
     required: bool = False
@@ -52,6 +53,7 @@ class Field:
     choices: Tuple[str, ...] = ()          # dla combo
     text_height: int = 4                   # dla text
     file_patterns: Tuple[Tuple[str, str], ...] = ()  # dla path (filedialog filetypes)
+    nullable: bool = False                 # int/float: puste pole = None (zamiast błędu)
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,38 @@ FIELD_SECTIONS: Tuple[Section, ...] = (
                   hint="Ile sekund pollować /health zanim start zostanie uznany za nieudany"),
             Field("request_timeout", "Timeout zapytań (s)", kind="int", vmin=1,
                   hint="Maks. czas tłumaczenia jednego zapytania — działa od razu"),
+        ),
+    ),
+    Section(
+        key="external", title="Zewnętrzny LLM", icon="🌐",
+        note="Włączone = tłumaczenia idą do zewnętrznego API (OpenAI-compatible) zamiast lokalnego "
+             "llama-servera. Przełączenie działa od razu po zapisaniu: lokalny model jest zatrzymywany, "
+             "a przy powrocie uruchamiany w tle. Klucz API trafia jawnie do config.yaml — plik jest "
+             "lokalny i ignorowany przez gita.",
+        fields=(
+            Field("enabled", "Użyj zewnętrznego API", kind="bool",
+                  hint="Niezaznaczone = lokalny llama-server (domyślnie); zaznaczone = tylko zewnętrzne API"),
+            Field("url", "URL API", kind="str",
+                  hint="Baza z wersją API (np. https://api.openai.com/v1, https://openrouter.ai/api/v1) "
+                       "albo pełny endpoint (…/chat/completions); samo http(s)://host dostaje dopisek "
+                       "/v1/chat/completions"),
+            Field("api_key", "Klucz API", kind="secret",
+                  hint="Wysyłany jako nagłówek „Authorization: Bearer …”; puste = bez nagłówka "
+                       "(np. własny serwer bez auth)"),
+            Field("model", "Model", kind="str",
+                  hint="Nazwa modelu w polu „model”, np. gpt-4o-mini, deepseek-chat, meta-llama/llama-3.3-70b"),
+            Field("timeout", "Timeout zapytań (s)", kind="int", vmin=1,
+                  hint="Maks. czas jednego tłumaczenia — zewnętrzne API bywa wolniejsze od lokalnego"),
+            Field("max_tokens", "Limit tokenów odpowiedzi", kind="int", vmin=1, nullable=True,
+                  hint="Puste = tyle co w „Tłumaczenie → Maks. tokenów odpowiedzi”. Modele rozumujące "
+                       "potrzebują wyższego limitu albo wyłączonego reasoningu — inaczej odpowiedź "
+                       "bywa pusta (finish_reason=length)"),
+            Field("extra_body", "Dodatkowe pola requestu", kind="text", text_height=4,
+                  hint="Mapa YAML doklejana do payloadu — pola specyficzne dla dostawcy. Np. "
+                       "reasoning_effort: none (DeepSeek/Gemini), thinking: {type: disabled} (DeepSeek), "
+                       "reasoning: {enabled: false} (OpenRouter), "
+                       "chat_template_kwargs: {enable_thinking: false} (Qwen), "
+                       "max_completion_tokens: 4096 (OpenAI reasoning)"),
         ),
     ),
     Section(
@@ -550,7 +584,7 @@ class SettingsWindow:
         row_idx += 1
         key = (sec.key, f.key)
 
-        if f.kind in ("int", "float", "str", "combo", "memory"):
+        if f.kind in ("int", "float", "str", "secret", "combo", "memory"):
             var = tk.StringVar(value="" if value is None else str(value))
             if f.kind == "combo":
                 choices = list(f.choices)
@@ -562,7 +596,8 @@ class SettingsWindow:
                 widget = ttk.Combobox(widget_row, textvariable=var, values=choices, state="readonly")
                 var.set(NO_MEMORY if value is None else str(value))
             else:
-                widget = ttk.Entry(widget_row, textvariable=var, width=52)
+                widget = ttk.Entry(widget_row, textvariable=var, width=52,
+                                   show="•" if f.kind == "secret" else "")
             widget.grid(row=0, column=0, sticky="ew")
             self._vars[key] = var
         elif f.kind == "bool":
@@ -613,6 +648,8 @@ class SettingsWindow:
                 text.configure(yscrollcommand=scroll.set)
                 scroll.pack(side="right", fill="y")
             text.pack(side="left", fill="both", expand=True)
+            if isinstance(value, (dict, list)):  # mapa z YAML-a pokazana jako tekst YAML
+                value = yaml.safe_dump(value, allow_unicode=True, sort_keys=False).rstrip()
             text.insert("1.0", "" if value is None else str(value))
             self._texts[key] = text
 
@@ -694,6 +731,9 @@ class SettingsWindow:
                 var = self._vars.get(key)
                 if var is not None:
                     raw = var.get().strip().replace(",", ".")
+                    if not raw and f.nullable:
+                        target[f.key] = None
+                        continue
                     try:
                         target[f.key] = float(raw) if f.kind == "float" else int(raw)
                     except ValueError:
@@ -741,6 +781,42 @@ class SettingsWindow:
                     errors.append(f"{where}: podaj wartość")
                     continue
                 out[f.key] = value
+
+        # Zewnętrzne API: URL i model są wymagane tylko przy włączonym trybie
+        external = values.get("external") or {}
+        if external.get("enabled"):
+            url = str(external.get("url") or "").strip()
+            if not url:
+                errors.append("Zewnętrzny LLM → URL API: podaj adres API")
+            elif not url.startswith(("http://", "https://")):
+                errors.append("Zewnętrzny LLM → URL API: adres musi zaczynać się od http:// lub https://")
+            if not str(external.get("model") or "").strip():
+                errors.append("Zewnętrzny LLM → Model: podaj nazwę modelu")
+
+        # Dodatkowe pola requestu: YAML mapa doklejana do payloadu zewnętrznego API.
+        # Normalizujemy do mapy — w configu leży wtedy czytelny blok YAML, nie string.
+        raw_extra = external.get("extra_body")
+        extra: Dict[str, object] = {}
+        if isinstance(raw_extra, dict):
+            extra = dict(raw_extra)
+        else:
+            text = str(raw_extra or "").strip()
+            if text:
+                try:
+                    parsed = yaml.safe_load(text)
+                except yaml.YAMLError as e:
+                    errors.append(f"Zewnętrzny LLM → Dodatkowe pola: niepoprawny YAML ({e})")
+                    parsed = None
+                if isinstance(parsed, dict):
+                    extra = dict(parsed)
+                elif parsed is not None:
+                    errors.append("Zewnętrzny LLM → Dodatkowe pola: oczekiwana mapa klucz → wartość")
+        reserved = sorted(set(extra) & {"messages", "model", "stream"})
+        if reserved:
+            errors.append("Zewnętrzny LLM → Dodatkowe pola: apka zarządza „" +
+                          "”, „".join(reserved) + "” — usuń je z tej mapy")
+        if "external" in values:
+            values["external"]["extra_body"] = extra
         return values, errors
 
     # ── zapis ────────────────────────────────────────────────────────────────

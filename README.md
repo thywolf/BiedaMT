@@ -4,7 +4,7 @@ Desktopowy tłumacz EN↔PL z pamięcią TMX (RAG) — jedna aplikacja: globalny
 
 ## Co robi
 
-- Uruchamia w tle **llama-server** (llama.cpp) z podanym modelem GGUF i komunikuje się z nim po HTTP
+- Uruchamia w tle **llama-server** (llama.cpp) z podanym modelem GGUF i komunikuje się z nim po HTTP — albo, po włączeniu w konfiguracji, tłumaczy **zewnętrznym modelem przez API** (URL + klucz + nazwa modelu, OpenAI-compatible)
 - Ładuje pamięci TMX z folderu `memories/` do **ChromaDB** (embeddingi `intfloat/multilingual-e5-small` z prefiksami `query:`/`passage:`)
 - Rejestruje **hotkey** — po naciśnięciu: `ctrl+c` → tłumaczenie → `delete` → `ctrl+v`, czyli tekst podmieniany jest w miejscu kursora
 - **Exact/fuzzy match** — dokładnie lub niemal identyczne zdanie wraca prosto z pamięci TMX (natychmiast, bez LLM); reszta: referencje RAG filtrowane po podobieństwie
@@ -18,7 +18,7 @@ Desktopowy tłumacz EN↔PL z pamięcią TMX (RAG) — jedna aplikacja: globalny
 
 - Windows
 - Python 3.10+
-- llama-server (llama.cpp) + model GGUF (np. Bielik)
+- llama-server (llama.cpp) + model GGUF (np. Bielik) — tylko w trybie lokalnym; tryb zewnętrzny wymaga jedynie dostępu do API (URL + klucz + nazwa modelu)
 - Przy pierwszym starcie: pobranie modelu embeddingów (~470 MB) z HuggingFace
 
 ## Instalacja
@@ -37,6 +37,7 @@ Aplikacja wymaga `config.yaml` przy starcie — bez niego nie uruchomi się.
 Wszystko w `config.yaml` — żadnych hardkodów w kodzie. W repo leży szablon `config.example.yaml`; `config.yaml` tworzysz z niego lokalnie i **nie commitujesz** (zawiera prywatne ścieżki do modelu i llama-servera — jest w `.gitignore`):
 
 - `llama` — ścieżka do llama-server, model, argumenty CLI, port, timeouty
+- `external` — opcjonalny zewnętrzny LLM (API OpenAI-compatible): `enabled`, `url`, `api_key`, `model`, `timeout`, `max_tokens` (puste = `translation.max_tokens`) i `extra_body` (mapa YAML doklejana do payloadu — pola specyficzne dla dostawcy). Przy `enabled: true` tłumaczenia idą do tego API, a lokalny llama-server nie jest uruchamiany; przełączenie w oknie ustawień działa od razu (lokalny model jest zatrzymywany, a przy powrocie startuje w tle). `url` to baza z wersją API (`https://api.openai.com/v1`, `https://openrouter.ai/api/v1`), samo `http(s)://host` (dostaje `/v1/chat/completions`) albo pełny endpoint. Klucz trafia jawnie do `config.yaml`, więc nie commituj tego pliku. **Modele rozumujące**: żeby nie paliły limitu tokenów na „myślenie” (objaw: pusta odpowiedź, `finish_reason=length`, u niektórych bramek HTTP 502), wpisz w `extra_body` np. `reasoning_effort: none` (DeepSeek/Gemini), `thinking: {type: disabled}` (DeepSeek), `reasoning: {enabled: false}` (OpenRouter) albo `chat_template_kwargs: {enable_thinking: false}` (Qwen3). Gdy provider odrzuci te pola błędem 400, apka ponawia request bez nich i loguje ostrzeżenie
 - `server` — port FastAPI (domyślnie 12345) i host; domyślny `0.0.0.0` = API dostępne z sieci lokalnej, `127.0.0.1` = tylko ten komputer
 - `rag` — model embeddingów, device (cpu/cuda), liczba wyników, progi dopasowań (fuzzy/reference), glosariusz (`terms_*`)
 - `translation` — pamięć startowa, gdy nie ma zapisanego stanu sesji (`default_memory`; null = żadna — dalej wybór checkboxami w tray), temperatura, max_tokens
@@ -64,6 +65,7 @@ Menu tray:
 - **Hotkey active/inactive** — włącza/wyłącza hotkey
 - **Memory** — checkboxy: które pamięci mają być używane w tłumaczeniu (żadna zaznaczona = tłumaczenie bez pamięci, wszystkie = szukanie we wszystkich; etykieta pokazuje aktualny wybór). Wybór jest zapamiętywany (`ui.state_file`) i wraca po restarcie; bez zapisanego stanu startuje z `translation.default_memory` (domyślnie: bez pamięci)
 - **EN -> PL / PL -> EN** — kierunek tłumaczenia
+- **LLM: local / external (model)** — informacyjnie, który backend aktualnie tłumaczy (zmiana w `Settings → Zewnętrzny LLM`)
 - **Reload memory** — wymusza re-import zaktualizowanego TMX do ChromaDB (submenu: wybór pamięci)
 - **Refresh memories** — przeskanowanie folderu `memories/` (dopisuje nowe)
 - **Reload replacements** — przeładowanie reguł zamian z `replacements.py`
@@ -84,7 +86,7 @@ Dla narzędzi zewnętrznych — klient ustawia własny system prompt. API nie ma
 - `GET /v1/memories` — lista pamięci
 - `POST /v1/memories/{name}/reload` — przeładowanie pamięci z TMX
 - `DELETE /v1/memories/{name}` — usunięcie pamięci z ChromaDB
-- `GET /health` — status (llama, pamięci, hotkey, wybór pamięci do tłumaczenia: `selected_memories`, `null` = wszystkie)
+- `GET /health` — status (backend LLM: `llm_backend` = `local`/`external`, `llm_model` w trybie zewnętrznym, llama, pamięci, hotkey, wybór pamięci do tłumaczenia: `selected_memories`, `null` = wszystkie). Zewnętrzne API nie jest odpytywane — to płatne zapytanie
 - `GET /` — GUI
 
 ## Struktura
@@ -111,3 +113,4 @@ MIT — patrz [LICENSE](LICENSE). Pamięci TMX i pliki modeli pozostają własno
 
 - Hotkey wymaga czasem uruchomienia jako administrator (zależnie od okna, w którym pracujesz)
 - Debug printy w konsoli (`🔥`, `📋`, `📖`) — można wyciszyć w razie potrzeby
+- Przy zewnętrznym LLM każda odpowiedź loguje `finish_reason` i zużycie tokenów (w tym `reasoning_tokens`) — jeśli tłumaczenie wraca puste albo w Tradosie pojawia się błąd 500/502, tam najszybciej widać, czy model uciął odpowiedź na limicie

@@ -393,16 +393,184 @@ def filter_references(refs: List[Dict]) -> List[Dict]:
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Backend LLM: lokalny llama-server albo zewnętrzne API (sekcja external)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def external_cfg() -> dict:
+    """Sekcja external z config.yaml (brak sekcji / zły typ = tryb lokalny)."""
+    cfg = CONFIG.get("external")
+    return cfg if isinstance(cfg, dict) else {}
+
+def external_llm_enabled() -> bool:
+    """Czy tłumaczenia mają iść do zewnętrznego API. Czytane przy każdym zapytaniu,
+    więc przełączenie z okna ustawień działa bez restartu aplikacji."""
+    return bool(external_cfg().get("enabled"))
+
+def external_model() -> str:
+    """Nazwa modelu wysyłana do zewnętrznego API w polu "model"."""
+    return str(external_cfg().get("model") or "").strip()
+
+def external_chat_url() -> str:
+    """Pełny URL /chat/completions z external.url.
+    Akceptowane formy: baza z wersją API (https://api.openai.com/v1), baza z własną
+    ścieżką (https://openrouter.ai/api/v1), samo http(s)://host (doklejane /v1)
+    oraz gotowy endpoint (…/chat/completions)."""
+    url = str(external_cfg().get("url") or "").strip()
+    if not url:
+        return ""
+    if "/chat/completions" in url:
+        return url
+    url = url.rstrip("/")
+    if url.count("/") <= 2:  # samo http(s)://host
+        url += "/v1"
+    return f"{url}/chat/completions"
+
+def llm_backend_label() -> str:
+    """Krótki opis aktywnego backendu (logi, menu tray)."""
+    if external_llm_enabled():
+        return f"external: {external_model() or '?'}"
+    return f"local: 127.0.0.1:{CONFIG['llama']['port']}"
+
+def external_max_tokens() -> int:
+    """Limit tokenów odpowiedzi zewnętrznego API (puste = translation.max_tokens)."""
+    value = external_cfg().get("max_tokens")
+    if value in (None, ""):
+        return int(CONFIG["translation"]["max_tokens"])
+    return int(value)
+
+def external_extra_body() -> dict:
+    """Dodatkowe pola payloadu z `external.extra_body` — mapa YAML albo tekst YAML.
+
+    Służy do pól specyficznych dla dostawcy/modelu, np. wyłączenia reasoningu:
+    `reasoning_effort: none` (DeepSeek, Gemini), `thinking: {type: disabled}`
+    (DeepSeek), `reasoning: {enabled: false}` (OpenRouter),
+    `chat_template_kwargs: {enable_thinking: false}` (Qwen),
+    `max_completion_tokens: 4096` (OpenAI)."""
+    raw = external_cfg().get("extra_body")
+    if isinstance(raw, dict):
+        return dict(raw)
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise RuntimeError(f"external.extra_body: niepoprawny YAML ({e})")
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise RuntimeError("external.extra_body: oczekiwana mapa klucz → wartość")
+    return dict(parsed)
+
+# Pola payloadu zarządzane przez apkę — extra_body nie może ich nadpisać
+_RESERVED_PAYLOAD_KEYS = ("messages", "model", "stream")
+# Fragmenty treści błędu 400, które znaczą „nieznane pole requestu”
+_UNKNOWN_PARAM_HINTS = ("unknown", "unsupported", "unrecognized", "extra fields",
+                        "additional propert", "not permitted")
+
+def llm_chat_request(prompt: str) -> str:
+    """Wyślij prompt do aktywnego backendu i zwróć sam tekst odpowiedzi.
+
+    Oba tryby mówią OpenAI-compatible `/chat/completions`. Lokalny llama-server
+    nie potrzebuje `model` ani nagłówka auth, ale dostaje `cache_prompt`; zewnętrzne
+    API wymaga `model` (i zwykle `Authorization: Bearer <klucz>`), a nieznane pola
+    potrafi odrzucić — dlatego payload jest budowany osobno dla każdego trybu."""
+    if external_llm_enabled():
+        url = external_chat_url()
+        if not url:
+            raise RuntimeError("external.enabled = true, ale external.url jest pusty — "
+                               "uzupełnij w Ustawieniach → Zewnętrzny LLM")
+        model = external_model()
+        if not model:
+            raise RuntimeError("external.enabled = true, ale external.model jest pusty — "
+                               "uzupełnij w Ustawieniach → Zewnętrzny LLM")
+        headers = {}
+        api_key = str(external_cfg().get("api_key") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        timeout = int(external_cfg().get("timeout") or CONFIG["llama"]["request_timeout"])
+        extra = external_extra_body()
+        for key in _RESERVED_PAYLOAD_KEYS:
+            if key in extra:
+                print(f"⚠️ external.extra_body: pomijam {key!r} (pole zarządzane przez apkę)")
+                extra.pop(key)
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": CONFIG["translation"]["temperature"],
+            "max_tokens": external_max_tokens(),
+            "stream": False,
+        }
+        if "max_completion_tokens" in extra:
+            # OpenAI: modele rozumujące odrzucają max_tokens, gdy podano max_completion_tokens
+            payload.pop("max_tokens", None)
+        base_payload = dict(payload)  # wariant bez dodatków — do retry po 400
+        payload.update(extra)
+    else:
+        url = f"http://127.0.0.1:{CONFIG['llama']['port']}/v1/chat/completions"
+        headers = None
+        timeout = CONFIG["llama"]["request_timeout"]
+        extra = {}
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": CONFIG["translation"]["temperature"],
+            "max_tokens": CONFIG["translation"]["max_tokens"],
+            "cache_prompt": True,
+            "stream": False,
+        }
+        base_payload = dict(payload)
+
+    def send(body: dict):
+        print(f"  🔗 {llm_backend_label()}: {url}")
+        return session.post(url, json=body, headers=headers, timeout=timeout)
+
+    try:
+        response = send(payload)
+        # Provider może nie znać pola z extra_body (400 „unknown/unsupported parameter”) —
+        # wtedy ponawiamy raz bez dodatków, żeby jedno złe pole nie zabiło tłumaczenia
+        if (response.status_code == 400 and extra
+                and any(h in (response.text or "").lower() for h in _UNKNOWN_PARAM_HINTS)):
+            print(f"  ⚠️ API odrzuciło dodatkowe pola ({', '.join(sorted(extra))}) — ponawiam bez nich")
+            payload = base_payload
+            response = send(payload)
+        print(f"  📥 Status: {response.status_code}")
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError:
+            # Treść błędu dostawcy (401/404/429) bywa jedyną wskazówką
+            print(f"  ❌ API {response.status_code}: {(response.text or '')[:300]}")
+            raise
+        data = response.json()
+        choice = (data.get("choices") or [{}])[0]
+        content = ((choice.get("message") or {}).get("content") or "").strip()
+        finish = choice.get("finish_reason")
+        usage = data.get("usage") or {}
+        reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        print(f"  📊 finish_reason={finish}, tokeny: {usage.get('prompt_tokens', '?')}+"
+              f"{usage.get('completion_tokens', '?')}"
+              + (f" (reasoning: {reasoning_tokens})" if reasoning_tokens else ""))
+        if not content:
+            if finish == "length":
+                raise RuntimeError(
+                    "model uciął odpowiedź na limicie tokenów (pusta treść, finish_reason=length) — "
+                    "podnieś limit tokenów (external.max_tokens) albo wyłącz reasoning "
+                    "w external.extra_body, np. reasoning_effort: none")
+            raise RuntimeError(f"pusta odpowiedź modelu (finish_reason={finish})")
+        print(f"  📥 Odpowiedź: {content[:60]}...")
+        return content
+    except requests.exceptions.RequestException as e:
+        print(f"  ❌ LLM error ({'external' if external_llm_enabled() else 'local'}): {e}")
+        raise
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Translation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def translate_with_rag(text: str, memories: Optional[Collection[str]] = None,
                        source_lang: str = "en", target_lang: str = "pl") -> str:
-    """Tłumaczenie z RAG — exact/fuzzy match z pamięci -> referencje -> llama-server.
+    """Tłumaczenie z RAG — exact/fuzzy match z pamięci -> referencje -> LLM
+    (lokalny llama-server albo external.* — patrz `llm_chat_request`).
     memories: None = wszystkie pamięci, zbiór nazw = tylko te, pusty zbiór = bez pamięci."""
-    llama_url = f"http://127.0.0.1:{CONFIG['llama']['port']}/v1/chat/completions"
-    print(f"  🔗 URL: {llama_url}")
-
     # 1) Exact match w pamięci — gotowe tłumaczenie bez LLM
     if rag_manager:
         exact = rag_manager.exact_lookup(text, source_lang, memories)
@@ -438,25 +606,7 @@ def translate_with_rag(text: str, memories: Optional[Collection[str]] = None,
 
     # Pełny prompt z terminami i referencjami (kierunek wg wyboru w menu)
     prompt = build_rag_prompt(text, similar, source_lang, target_lang, glossary)
-
-    payload = {
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": CONFIG["translation"]["temperature"],
-        "max_tokens": CONFIG["translation"]["max_tokens"],
-        "cache_prompt": True,
-        "stream": False,
-    }
-
-    try:
-        response = session.post(llama_url, json=payload, timeout=CONFIG["llama"]["request_timeout"])
-        print(f"  📥 Status: {response.status_code}")
-        response.raise_for_status()
-        result = response.json()["choices"][0]["message"]["content"].strip()
-        print(f"  📥 Odpowiedź: {result[:60]}...")
-        return result
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ Llama server error: {e}")
-        raise
+    return llm_chat_request(prompt)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hotkey action
@@ -658,6 +808,11 @@ def rebuild_menu():
                 MenuItem("PL -> EN", toggle_language_pl, checked=lambda item: not state_en, radio=True),
             ),
         ),
+        MenuItem(
+            "LLM: " + (f"external ({external_model()})" if external_llm_enabled() else "local"),
+            None,
+            enabled=False,
+        ),
         Menu.SEPARATOR,
         MenuItem(
             "Reload memory",
@@ -711,6 +866,20 @@ def save_settings(new_values: dict) -> dict:
     for section, values in new_values.items():
         CONFIG.setdefault(section, {}).update(values)
 
+    notes = []
+    # Przełączenie backendu LLM działa od razu: przy zewnętrznym zwalniamy lokalny
+    # model, przy powrocie do lokalnego startujemy llama-server w tle.
+    if "external.enabled" in changed:
+        if external_llm_enabled():
+            stop_llama()
+            notes.append(f"Tłumaczenia idą teraz do zewnętrznego API ({llm_backend_label()}); "
+                         "lokalny llama-server zatrzymany.")
+        else:
+            start_llama_background()
+            notes.append("Wracam do lokalnego llama-servera — startuje w tle "
+                         "(kilka–kilkadziesiąt sekund, zależnie od modelu).")
+        print(f"🌐 LLM: {llm_backend_label()}")
+
     if "ui.hotkey" in changed:
         rebind_hotkey()
     if any(k.startswith("prompt.") for k in changed):
@@ -728,7 +897,13 @@ def save_settings(new_values: dict) -> dict:
 
     llama_keys = sorted(k for k in changed if k in RESTART_LLAMA_KEYS)
     app_keys = sorted(k for k in changed if k in RESTART_APP_KEYS)
-    notes = []
+    if external_llm_enabled():
+        # Lokalny serwer nie jest teraz używany — nie ma czego restartować,
+        # a kliknięcie „Restart LLM” niepotrzebnie ładowałoby model do VRAM.
+        if llama_keys:
+            notes.append("Ustawienia lokalnego llama-servera zapisane — zadziałają po powrocie "
+                         f"do trybu lokalnego (teraz tłumaczy {llm_backend_label()}).")
+        llama_keys = []
     if "rag.embedding_model" in changed:
         notes.append("Zmiana modelu embeddingów wymusi przy restarcie ponowne indeksowanie "
                      "pamięci z TMX (i pobranie modelu, jeśli go nie ma lokalnie).")
@@ -827,16 +1002,20 @@ def start_llama():
         raise LlamaStartError(f"Błąd uruchamiania llama-server: {e}")
 
 def warmup_llama():
-    """Rozgrzej model jednym drobnym zapytaniem (w tle, nie blokuje startu)."""
-    try:
-        requests.post(
-            f"http://127.0.0.1:{CONFIG['llama']['port']}/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": "OK"}], "max_tokens": 4, "stream": False},
-            timeout=CONFIG["llama"]["request_timeout"],
-        )
-        print("🔥 llama-server rozgrzany")
-    except Exception as e:
-        print(f"⚠️ Warmup pominięty: {e}")
+    """Rozgrzej model jednym drobnym zapytaniem (w tle, nie blokuje startu).
+    W trybie zewnętrznym LLM nie ruszamy — warmup to płatne (i niepotrzebne) zapytanie."""
+    if external_llm_enabled():
+        print(f"🌐 Tryb zewnętrzny ({llm_backend_label()}) — pomijam warmup LLM")
+    else:
+        try:
+            requests.post(
+                f"http://127.0.0.1:{CONFIG['llama']['port']}/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "OK"}], "max_tokens": 4, "stream": False},
+                timeout=CONFIG["llama"]["request_timeout"],
+            )
+            print("🔥 llama-server rozgrzany")
+        except Exception as e:
+            print(f"⚠️ Warmup pominięty: {e}")
     # Rozgrzej też RAG: pierwszy encode modelu, skan glosariuszu obu kierunków
     # i leniwe ładowanie indeksów HNSW — inaczej te koszty trafiają w pierwsze tłumaczenie
     if rag_manager:
@@ -874,6 +1053,27 @@ def restart_llama_async(on_done: Callable[[], None], on_error: Callable[[str], N
             on_error(f"{type(e).__name__}: {e}")
         finally:
             _llama_restart_lock.release()
+    threading.Thread(target=worker, daemon=True).start()
+
+def start_llama_background() -> None:
+    """Uruchom lokalny llama-server w tle, jeśli nie działa (powrót z trybu
+    zewnętrznego). Blokujący start nie może zatrzymywać wątku GUI."""
+    if llama_process and llama_process.poll() is None:
+        return
+
+    def worker():
+        if not _llama_restart_lock.acquire(blocking=False):
+            print("⚠️ llama-server już startuje — pomijam")
+            return
+        try:
+            start_llama()
+        except LlamaStartError as e:
+            print(f"❌ {e}")
+        except Exception as e:
+            print(f"❌ Nie udało się uruchomić llama-servera: {type(e).__name__}: {e}")
+        finally:
+            _llama_restart_lock.release()
+
     threading.Thread(target=worker, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1161,14 +1361,20 @@ async def delete_memory(memory_name: str):
 
 @app.get("/health")
 async def health():
-    """Sprawdzenie stanu."""
-    lm_status = "ok"
-    try:
-        requests.get(f"http://127.0.0.1:{CONFIG['llama']['port']}/health", timeout=2)
-    except Exception:
-        lm_status = "disconnected"
+    """Sprawdzenie stanu. Zewnętrznego API nie odpytujemy — to płatne zapytanie."""
+    external = external_llm_enabled()
+    if external:
+        lm_status = "external"
+    else:
+        lm_status = "ok"
+        try:
+            requests.get(f"http://127.0.0.1:{CONFIG['llama']['port']}/health", timeout=2)
+        except Exception:
+            lm_status = "disconnected"
     return {
         "status": "running",
+        "llm_backend": "external" if external else "local",
+        "llm_model": external_model() if external else None,
         "llama_server": lm_status,
         "memories": list(rag_manager.engines.keys()) if rag_manager else [],
         "selected_memories": sorted(selected_memories) if selected_memories is not None else None,
@@ -1212,12 +1418,15 @@ def main():
     _prune_selected_memories()
     print(f"📌 Wybór pamięci: {_memory_label()}")
     
-    # Start llama
-    try:
-        start_llama()
-    except LlamaStartError as e:
-        print(f"❌ {e}")
-        sys.exit(1)
+    # Start llama — w trybie zewnętrznym lokalny serwer nie jest uruchamiany
+    if external_llm_enabled():
+        print(f"🌐 Tryb zewnętrzny: {llm_backend_label()} — nie uruchamiam llama-servera")
+    else:
+        try:
+            start_llama()
+        except LlamaStartError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
     atexit.register(stop_llama)
     
     # Setup hotkey
@@ -1246,7 +1455,7 @@ def main():
     print(f"📁 Pamięci: {CONFIG['memories']['dir']}")
     print(f"🔗 API: http://localhost:{CONFIG['server']['port']}/v1/chat/completions")
     print(f"📚 Załadowane: {list(rag_manager.engines.keys())}")
-    print(f"🤖 Llama: http://localhost:{CONFIG['llama']['port']}")
+    print(f"🤖 LLM: {llm_backend_label()}")
     print(f"⌨️  Hotkey: {CONFIG['ui']['hotkey']}")
     print("="*50 + "\n")
     

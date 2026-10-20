@@ -23,6 +23,36 @@ llama:
   # Timeout zapytań do llama-server (sekundy)
   request_timeout: 120
 
+# Zewnętrzny LLM (API OpenAI-compatible) — alternatywa dla lokalnego llama-servera.
+# Gdy enabled: true, tłumaczenia idą do tego API, a lokalny llama-server nie jest
+# uruchamiany przy starcie (przełączenie z okna ustawień działa od razu).
+external:
+  enabled: false
+  # Bazowy URL API. Akceptowane formy:
+  #   https://api.openai.com/v1              -> …/v1/chat/completions
+  #   https://openrouter.ai/api/v1           -> …/api/v1/chat/completions
+  #   https://moj-serwer                     -> …/v1/chat/completions
+  #   https://moj-serwer/v1/chat/completions (pełny endpoint)
+  url: "https://api.openai.com/v1"
+  # Klucz API (nagłówek Authorization: Bearer …). Pusty = bez nagłówka
+  # (np. własny serwer w sieci bez auth). Plik jest lokalny — nie commituj go.
+  api_key: ""
+  # Nazwa modelu w polu "model"
+  model: "gpt-4o-mini"
+  # Timeout zapytania (sekundy) — zewnętrzne API bywa wolniejsze od lokalnego
+  timeout: 120
+  # Limit tokenów odpowiedzi (null = tyle co translation.max_tokens). Modele
+  # rozumujące potrzebują wyższego limitu albo wyłączonego reasoningu.
+  max_tokens: null
+  # Dodatkowe pola doklejane do payloadu (mapa YAML) — pola specyficzne dla dostawcy.
+  # Przykłady wyłączenia reasoningu:
+  #   reasoning_effort: none                          # DeepSeek, Gemini 2.5
+  #   thinking: {type: disabled}                      # DeepSeek
+  #   reasoning: {enabled: false}                     # OpenRouter
+  #   chat_template_kwargs: {enable_thinking: false}  # Qwen3
+  #   max_completion_tokens: 4096                     # OpenAI (modele rozumujące)
+  extra_body: {}
+
 server:
   # Port FastAPI
   port: 12345
